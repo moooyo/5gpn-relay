@@ -24,7 +24,7 @@ Gum and the official Envoy release binary are installed automatically. Both down
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/moooyo/5gpn-relay/main/install.sh | sudo bash -s -- install
+curl -fsSL https://moooyo.github.io/5gpn-relay/install.sh | sudo bash
 ```
 
 After installation, open the management interface with:
