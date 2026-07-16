@@ -14,6 +14,7 @@ grep -q 'reissue-cert' <<<"$help_output"
 grep -q 'https://1.1.1.1/dns-query' "$INSTALLER"
 grep -q 'ENVOY_SHA256_X86_64=' "$INSTALLER"
 grep -q 'prompt_input "Relay domain:"' "$INSTALLER"
+# shellcheck disable=SC2016
 grep -Fq 'prompt_input "Public IPv4 for the DNS A record:" "${PUBLIC_IPV4:-$detected_public_ipv4}"' "$INSTALLER"
 
 if grep -q 'prompt_input "Relay domain:" .*relay\.example\.com' "$INSTALLER"; then
@@ -28,6 +29,7 @@ fi
 
 grep -q 'LISTEN_ADDRESS="0.0.0.0"' "$INSTALLER"
 grep -q 'LISTEN_PORT="443"' "$INSTALLER"
+grep -q '"Install"|"Reconfigure / reinstall") install_relay; return 0 ;;' "$INSTALLER"
 
 stdin_help_output="$(bash -s -- help <"$INSTALLER")"
 grep -q 'Apple Relay manager' <<<"$stdin_help_output"

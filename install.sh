@@ -1089,7 +1089,7 @@ manage_menu() {
             selection="$(choose "Apple Relay" "Install" "Quit")" || return 0
         fi
         case "$selection" in
-            "Install"|"Reconfigure / reinstall") install_relay ;;
+            "Install"|"Reconfigure / reinstall") install_relay; return 0 ;;
             "Status") show_status | "$GUM_BIN" pager ;;
             "Restart") restart_relay ;;
             "Rotate token") rotate_token ;;
