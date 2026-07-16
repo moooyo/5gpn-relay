@@ -1,0 +1,22 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Run static checks
+        run: bash tests/static.sh
+      - name: Run unit checks
+        run: bash tests/unit.sh
+      - name: Run ShellCheck
+        run: shellcheck -x install.sh tests/*.sh
