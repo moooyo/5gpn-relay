@@ -844,7 +844,7 @@ EOF
 collect_install_configuration() {
     local value detected_public_ipv4
     while true; do
-        value="$(prompt_input "Relay domain:" "${DOMAIN:-relay.example.com}")"
+        value="$(prompt_input "Relay domain:")"
         value="${value,,}"
         if is_valid_domain "$value"; then
             DOMAIN="$value"

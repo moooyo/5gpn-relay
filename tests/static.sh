@@ -13,6 +13,13 @@ grep -q 'decommission' <<<"$help_output"
 grep -q 'reissue-cert' <<<"$help_output"
 grep -q 'https://1.1.1.1/dns-query' "$INSTALLER"
 grep -q 'ENVOY_SHA256_X86_64=' "$INSTALLER"
+grep -q 'prompt_input "Relay domain:"' "$INSTALLER"
+grep -Fq 'prompt_input "Public IPv4 for the DNS A record:" "${PUBLIC_IPV4:-$detected_public_ipv4}"' "$INSTALLER"
+
+if grep -q 'prompt_input "Relay domain:" .*relay\.example\.com' "$INSTALLER"; then
+    echo "The relay domain prompt must not have a default value." >&2
+    exit 1
+fi
 
 stdin_help_output="$(bash -s -- help <"$INSTALLER")"
 grep -q 'Apple Relay manager' <<<"$stdin_help_output"
