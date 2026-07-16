@@ -14,6 +14,9 @@ grep -q 'reissue-cert' <<<"$help_output"
 grep -q 'https://1.1.1.1/dns-query' "$INSTALLER"
 grep -q 'ENVOY_SHA256_X86_64=' "$INSTALLER"
 
+stdin_help_output="$(bash -s -- help <"$INSTALLER")"
+grep -q 'Apple Relay manager' <<<"$stdin_help_output"
+
 if grep -nE 'dns-cloudflare|self-signed|HTTP3RelayURL|relay_http3' "$INSTALLER"; then
     echo "Only HTTP-01 certificates and the HTTP/2 relay are supported." >&2
     exit 1

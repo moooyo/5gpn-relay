@@ -17,6 +17,6 @@ jobs:
       - name: Run static checks
         run: bash tests/static.sh
       - name: Run unit checks
-        run: bash tests/unit.sh
+        run: sudo bash tests/unit.sh
       - name: Run ShellCheck
         run: shellcheck -x install.sh tests/*.sh
