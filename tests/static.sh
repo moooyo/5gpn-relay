@@ -30,6 +30,12 @@ fi
 grep -q 'LISTEN_ADDRESS="0.0.0.0"' "$INSTALLER"
 grep -q 'LISTEN_PORT="443"' "$INSTALLER"
 grep -q '"Install"|"Reconfigure / reinstall") install_relay; return 0 ;;' "$INSTALLER"
+grep -q "printf 'Relay domain: %s" "$INSTALLER"
+
+if grep -q "printf 'HTTP/2 URL:" "$INSTALLER"; then
+    echo "The installation result must display only the relay domain." >&2
+    exit 1
+fi
 
 stdin_help_output="$(bash -s -- help <"$INSTALLER")"
 grep -q 'Apple Relay manager' <<<"$stdin_help_output"

@@ -911,7 +911,7 @@ install_relay() {
     token="$(cat "$TOKEN_FILE")"
     {
         printf 'Apple Relay is ready.\n\n'
-        printf 'HTTP/2 URL: https://%s:%s\n' "$DOMAIN" "$LISTEN_PORT"
+        printf 'Relay domain: %s\n' "$DOMAIN"
         printf 'Header: X-Relay-Token: %s\n\n' "$token"
         printf 'The token is shown now and stored at %s (root-only).\n' "$TOKEN_FILE"
     } | "$GUM_BIN" style --border rounded --padding "1 2" --border-foreground 212
