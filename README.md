@@ -16,7 +16,7 @@ It manages:
 - Debian/Ubuntu or a compatible RPM-based distribution.
 - A relay hostname that clients can reach.
 - A direct, DNS-only `A` record for that hostname.
-- TCP on the selected relay port, normally `443`.
+- TCP `443` for the relay service.
 - TCP `80` for Let's Encrypt HTTP-01 issuance and renewal.
 
 Gum and the official Envoy release binary are installed automatically. Both downloads use fixed versions and SHA-256 verification; no container runtime is required.
@@ -35,7 +35,7 @@ sudo relayctl
 
 ## Certificates
 
-The manager deliberately supports one certificate path: **Let's Encrypt HTTP-01**. During installation, it shows the exact `A` record to create and polls Cloudflare's `1.1.1.1` resolver until the public answer matches the selected server IPv4 address. Installation stops if the answer differs or an `AAAA` record is present. The public Internet must also be able to reach TCP port `80` on the selected listen address.
+The manager deliberately supports one certificate path: **Let's Encrypt HTTP-01**. During installation, it shows the exact `A` record to create and polls Cloudflare's `1.1.1.1` resolver until the public answer matches the selected server IPv4 address. Installation stops if the answer differs or an `AAAA` record is present. The public Internet must also be able to reach TCP port `80`. The relay itself always listens on `0.0.0.0:443`.
 
 The manager installs a daily systemd renewal timer. Envoy is restarted only when the deployed certificate changes. A forced reissue is also available from the Gum interface.
 

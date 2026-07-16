@@ -863,23 +863,8 @@ collect_install_configuration() {
         log_warn "Enter a globally routable IPv4 address."
     done
 
-    while true; do
-        value="$(prompt_input "Listen IP address:" "${LISTEN_ADDRESS:-0.0.0.0}")"
-        if is_valid_ip "$value"; then
-            LISTEN_ADDRESS="$value"
-            break
-        fi
-        log_warn "Enter a valid IPv4 address."
-    done
-
-    while true; do
-        value="$(prompt_input "Relay TCP port:" "${LISTEN_PORT:-443}")"
-        if is_valid_port "$value"; then
-            LISTEN_PORT="$value"
-            break
-        fi
-        log_warn "Enter a port between 1 and 65535."
-    done
+    LISTEN_ADDRESS="0.0.0.0"
+    LISTEN_PORT="443"
 
     while true; do
         CERT_EMAIL="$(prompt_input "Let's Encrypt account email:" "${CERT_EMAIL:-}")"

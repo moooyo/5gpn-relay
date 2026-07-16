@@ -21,6 +21,14 @@ if grep -q 'prompt_input "Relay domain:" .*relay\.example\.com' "$INSTALLER"; th
     exit 1
 fi
 
+if grep -qE 'prompt_input "(Listen IP address|Relay TCP port):"' "$INSTALLER"; then
+    echo "The listen address and relay port must not be prompted." >&2
+    exit 1
+fi
+
+grep -q 'LISTEN_ADDRESS="0.0.0.0"' "$INSTALLER"
+grep -q 'LISTEN_PORT="443"' "$INSTALLER"
+
 stdin_help_output="$(bash -s -- help <"$INSTALLER")"
 grep -q 'Apple Relay manager' <<<"$stdin_help_output"
 
