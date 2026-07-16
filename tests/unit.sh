@@ -12,7 +12,7 @@ export APPLE_RELAY_STATE_DIR="${TEST_ROOT}/var/lib/apple-relay"
 export APPLE_RELAY_UNIT_DIR="${TEST_ROOT}/systemd"
 export APPLE_RELAY_LAUNCHER_PATH="${TEST_ROOT}/bin/relayctl"
 
-# shellcheck source=../install.sh
+# shellcheck source=install.sh
 source "${ROOT_DIR}/install.sh"
 
 SERVICE_USER="apple-relay-unit-test-$$"
