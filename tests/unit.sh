@@ -11,6 +11,7 @@ export APPLE_RELAY_CONFIG_DIR="${TEST_ROOT}/etc/apple-relay"
 export APPLE_RELAY_STATE_DIR="${TEST_ROOT}/var/lib/apple-relay"
 export APPLE_RELAY_UNIT_DIR="${TEST_ROOT}/systemd"
 export APPLE_RELAY_LAUNCHER_PATH="${TEST_ROOT}/bin/relayctl"
+export APPLE_RELAY_LETSENCRYPT_LIVE_DIR="${TEST_ROOT}/etc/letsencrypt/live"
 
 # shellcheck source=install.sh
 source "${ROOT_DIR}/install.sh"
@@ -22,6 +23,16 @@ assert_rejected() {
         printf 'Expected command to reject its input: %s\n' "$*" >&2
         exit 1
     fi
+}
+
+create_certificate() {
+    local certificate="$1"
+    local private_key="$2"
+    local domain="$3"
+    mkdir -p "$(dirname "$certificate")"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -subj "/CN=${domain}" -addext "subjectAltName=DNS:${domain}" \
+        -keyout "$private_key" -out "$certificate" >/dev/null 2>&1
 }
 
 is_valid_domain relay.example.com
@@ -71,5 +82,54 @@ grep -q 'upgrade_type: CONNECT-UDP' "$ENVOY_CONFIG"
 grep -q 'name: x-relay-token' "$ENVOY_CONFIG"
 assert_rejected grep -q 'codec_type: HTTP3' "$ENVOY_CONFIG"
 [[ "$(stat -c %a "$ENVOY_CONFIG")" == 600 ]]
+
+mkdir -p "$TLS_DIR"
+create_certificate "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem" "$DOMAIN"
+validate_certificate_pair "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem"
+now="$(date +%s)"
+assert_rejected certificate_is_current_for_domain "${TLS_DIR}/fullchain.pem" "$((now - 172800))"
+assert_rejected certificate_is_current_for_domain "${TLS_DIR}/fullchain.pem" "$((now + 172800))"
+create_certificate "${TEST_ROOT}/other/fullchain.pem" "${TEST_ROOT}/other/privkey.pem" other.example.com
+assert_rejected certificate_is_current_for_domain "${TEST_ROOT}/other/fullchain.pem"
+assert_rejected validate_certificate_pair \
+    "${TLS_DIR}/fullchain.pem" "${TEST_ROOT}/other/privkey.pem"
+
+certificate_before="$(sha256_file "${TLS_DIR}/fullchain.pem")"
+issue_count=0
+install_certbot() { :; }
+issue_letsencrypt_certificate() { issue_count=$((issue_count + 1)); }
+ensure_letsencrypt_certificate
+[[ "$issue_count" == 0 ]]
+[[ "$(sha256_file "${TLS_DIR}/fullchain.pem")" == "$certificate_before" ]]
+
+lineage="${LETSENCRYPT_LIVE_DIR}/${DOMAIN}"
+mkdir -p "$lineage"
+cp "${TLS_DIR}/fullchain.pem" "${lineage}/fullchain.pem"
+cp "${TLS_DIR}/privkey.pem" "${lineage}/privkey.pem"
+rm -f "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem"
+ensure_letsencrypt_certificate
+[[ "$issue_count" == 0 ]]
+validate_certificate_pair "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem"
+
+printf 'invalid\n' >"${TLS_DIR}/fullchain.pem"
+printf 'invalid\n' >"${TLS_DIR}/privkey.pem"
+printf 'invalid\n' >"${lineage}/fullchain.pem"
+printf 'invalid\n' >"${lineage}/privkey.pem"
+ensure_letsencrypt_certificate
+[[ "$issue_count" == 1 ]]
+
+reissue_events=()
+attach_tty() { :; }
+require_tty() { :; }
+install_gum() { :; }
+confirm() { return 0; }
+dns_points_to_relay() { return 0; }
+issue_letsencrypt_certificate() { reissue_events+=(issue); }
+validate_envoy_config() { reissue_events+=(validate); }
+systemctl() { reissue_events+=(restart); }
+wait_for_relay_ready() { reissue_events+=(ready); }
+log_ok() { :; }
+reissue_certificate
+[[ "${reissue_events[*]}" == "issue validate restart ready" ]]
 
 echo "Unit checks passed."

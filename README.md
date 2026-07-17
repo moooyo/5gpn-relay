@@ -37,7 +37,7 @@ sudo relayctl
 
 The manager deliberately supports one certificate path: **Let's Encrypt HTTP-01**. During installation, it shows the exact `A` record to create and polls Cloudflare's `1.1.1.1` resolver until the public answer matches the selected server IPv4 address. Installation stops if the answer differs or an `AAAA` record is present. The public Internet must also be able to reach TCP port `80`. The relay itself always listens on `0.0.0.0:443`.
 
-The manager installs a daily systemd renewal timer. Envoy is restarted only when the deployed certificate changes. A forced reissue is also available from the Gum interface.
+On installation and reconfiguration, the manager first validates the certificate's activation and expiration times, hostname, and private key. It reuses a valid deployed certificate or Certbot lineage and requests a certificate only when neither is valid. The manager also installs a daily systemd renewal timer; the renewal job restarts Envoy only when the deployed certificate changes. A forced reissue is available from the Gum interface and restarts Envoy after issuance succeeds.
 
 ## Client values
 

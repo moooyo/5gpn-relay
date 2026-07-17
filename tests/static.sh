@@ -32,6 +32,13 @@ grep -q 'LISTEN_PORT="443"' "$INSTALLER"
 grep -q '"Install"|"Reconfigure / reinstall") install_relay; return 0 ;;' "$INSTALLER"
 grep -q "printf 'Relay domain: %s" "$INSTALLER"
 
+install_body="$(sed -n '/^install_relay() {$/,/^}$/p' "$INSTALLER")"
+grep -q 'ensure_letsencrypt_certificate' <<<"$install_body"
+if grep -qE '^[[:space:]]+issue_letsencrypt_certificate([[:space:]]|$)' <<<"$install_body"; then
+    echo "Installation must validate and reuse a current certificate before requesting one." >&2
+    exit 1
+fi
+
 if grep -q "printf 'HTTP/2 URL:" "$INSTALLER"; then
     echo "The installation result must display only the relay domain." >&2
     exit 1

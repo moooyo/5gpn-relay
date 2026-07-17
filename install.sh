@@ -22,6 +22,7 @@ ENV_FILE="${CONFIG_DIR}/relay.env"
 TOKEN_FILE="${CONFIG_DIR}/token"
 ENVOY_CONFIG="${CONFIG_DIR}/envoy.yaml"
 TLS_DIR="${CONFIG_DIR}/tls"
+LETSENCRYPT_LIVE_DIR="${APPLE_RELAY_LETSENCRYPT_LIVE_DIR:-/etc/letsencrypt/live}"
 SERVICE_UNIT="${UNIT_DIR}/apple-relay.service"
 RENEW_SERVICE_UNIT="${UNIT_DIR}/apple-relay-renew.service"
 RENEW_TIMER_UNIT="${UNIT_DIR}/apple-relay-renew.timer"
@@ -574,15 +575,34 @@ certificate_matches_key() {
     [[ -n "$cert_hash" && "$cert_hash" == "$key_hash" ]]
 }
 
+certificate_is_current_for_domain() {
+    local certificate="$1"
+    local verification_time="${2:-}"
+    local not_before not_after not_before_epoch not_after_epoch current_time
+    [[ -s "$certificate" ]] || return 1
+    [[ -z "$verification_time" || "$verification_time" =~ ^[0-9]+$ ]] || return 1
+
+    not_before="$(LC_ALL=C openssl x509 -in "$certificate" -noout -startdate 2>/dev/null)" \
+        || return 1
+    not_after="$(LC_ALL=C openssl x509 -in "$certificate" -noout -enddate 2>/dev/null)" \
+        || return 1
+    not_before_epoch="$(LC_ALL=C date -u -d "${not_before#notBefore=}" +%s 2>/dev/null)" \
+        || return 1
+    not_after_epoch="$(LC_ALL=C date -u -d "${not_after#notAfter=}" +%s 2>/dev/null)" \
+        || return 1
+    current_time="${verification_time:-$(date -u +%s)}"
+    (( current_time >= not_before_epoch && current_time <= not_after_epoch )) \
+        || return 1
+    openssl x509 -in "$certificate" -noout -checkhost "$DOMAIN" >/dev/null 2>&1
+}
+
 validate_certificate_pair() {
     local certificate="$1"
     local private_key="$2"
     [[ -s "$certificate" && -s "$private_key" ]] || return 1
-    openssl x509 -in "$certificate" -noout -checkend 0 >/dev/null \
+    certificate_is_current_for_domain "$certificate" \
         || return 1
     certificate_matches_key "$certificate" "$private_key" \
-        || return 1
-    openssl x509 -in "$certificate" -noout -checkhost "$DOMAIN" >/dev/null \
         || return 1
 }
 
@@ -618,10 +638,32 @@ copy_certificate() {
 }
 
 copy_letsencrypt_lineage() {
-    local lineage="/etc/letsencrypt/live/${DOMAIN}"
+    local lineage="${LETSENCRYPT_LIVE_DIR}/${DOMAIN}"
     [[ -s "${lineage}/fullchain.pem" && -s "${lineage}/privkey.pem" ]] \
         || die "The Let's Encrypt lineage for ${DOMAIN} is missing."
     copy_certificate "${lineage}/fullchain.pem" "${lineage}/privkey.pem"
+}
+
+ensure_letsencrypt_certificate() {
+    local deployed_certificate="${TLS_DIR}/fullchain.pem"
+    local deployed_private_key="${TLS_DIR}/privkey.pem"
+    local lineage="${LETSENCRYPT_LIVE_DIR}/${DOMAIN}"
+
+    if validate_certificate_pair "$deployed_certificate" "$deployed_private_key"; then
+        install_certbot
+        log_info "The deployed certificate is valid and within its validity period; it will be reused."
+        return 0
+    fi
+
+    if validate_certificate_pair "${lineage}/fullchain.pem" "${lineage}/privkey.pem"; then
+        install_certbot
+        copy_letsencrypt_lineage
+        log_info "The existing Let's Encrypt certificate is valid and within its validity period; it will be reused."
+        return 0
+    fi
+
+    log_info "No valid current certificate was found; requesting a Let's Encrypt certificate."
+    issue_letsencrypt_certificate
 }
 
 issue_letsencrypt_certificate() {
@@ -898,7 +940,7 @@ install_relay() {
     if [[ ! -s "$TOKEN_FILE" ]]; then
         random_token | write_atomic "$TOKEN_FILE" 600
     fi
-    issue_letsencrypt_certificate
+    ensure_letsencrypt_certificate
     render_envoy_config
     secure_runtime_files
     validate_envoy_config
