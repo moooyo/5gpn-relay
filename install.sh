@@ -456,7 +456,11 @@ kind = socket.SOCK_STREAM if protocol == "tcp" else socket.SOCK_DGRAM
 sock = socket.socket(family, kind)
 try:
     sock.bind((address, int(raw_port)))
-except OSError:
+except OSError as error:
+    print(
+        f"{protocol.upper()} {address}:{raw_port} bind failed: {error}",
+        file=sys.stderr,
+    )
     raise SystemExit(1)
 finally:
     sock.close()
@@ -470,11 +474,11 @@ preflight_ports() {
     systemctl is-active --quiet apple-relay.service 2>/dev/null && service_active=1
     if [[ "$service_active" != "1" || "$LISTEN_PORT" != "$previous_listen_port" ]]; then
         port_is_available tcp "$LISTEN_ADDRESS" "$LISTEN_PORT" \
-            || die "TCP ${LISTEN_ADDRESS}:${LISTEN_PORT} is already in use."
+            || die "TCP ${LISTEN_ADDRESS}:${LISTEN_PORT} could not be bound."
     fi
     if [[ "$service_active" != "1" || "$ADMIN_PORT" != "$previous_admin_port" ]]; then
         port_is_available tcp 127.0.0.1 "$ADMIN_PORT" \
-            || die "TCP 127.0.0.1:${ADMIN_PORT} is already in use."
+            || die "TCP 127.0.0.1:${ADMIN_PORT} could not be bound."
     fi
 }
 
@@ -670,7 +674,7 @@ issue_letsencrypt_certificate() {
     local force="${1:-0}"
     install_certbot
     port_is_available tcp "$LISTEN_ADDRESS" 80 \
-        || die "TCP ${LISTEN_ADDRESS}:80 is required for the HTTP-01 challenge."
+        || die "TCP ${LISTEN_ADDRESS}:80 could not be bound for the HTTP-01 challenge."
     local address_args=()
     local renewal_args=(--keep-until-expiring)
     [[ "$LISTEN_ADDRESS" == "0.0.0.0" ]] || address_args=(--http-01-address "$LISTEN_ADDRESS")

@@ -55,6 +55,32 @@ is_valid_port 65535
 assert_rejected is_valid_port 0
 assert_rejected is_valid_port 65536
 
+coproc PORT_HOLDER {
+    python3 - <<'PY'
+import socket
+import signal
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.bind(("127.0.0.1", 0))
+sock.listen()
+print(sock.getsockname()[1], flush=True)
+signal.pause()
+sock.close()
+PY
+}
+port_holder_pid="$PORT_HOLDER_PID"
+read -r occupied_port <&"${PORT_HOLDER[0]}"
+if bind_error="$(port_is_available tcp 127.0.0.1 "$occupied_port" 2>&1)"; then
+    echo "Expected an occupied port to be rejected." >&2
+    kill "$port_holder_pid" 2>/dev/null || true
+    wait "$port_holder_pid" 2>/dev/null || true
+    exit 1
+fi
+kill "$port_holder_pid" 2>/dev/null || true
+wait "$port_holder_pid" 2>/dev/null || true
+grep -Fq "TCP 127.0.0.1:${occupied_port} bind failed:" <<<"$bind_error"
+grep -Fq '[Errno ' <<<"$bind_error"
+
 DOMAIN=relay.example.com
 LISTEN_ADDRESS=0.0.0.0
 LISTEN_PORT=443
