@@ -38,6 +38,54 @@ ADMIN_PORT="9901"
 PUBLIC_IPV4=""
 CERT_EMAIL=""
 
+DNS_QUERY_CONNECT_TIMEOUT_SECONDS=5
+DNS_QUERY_MAX_TIME_SECONDS=15
+DNS_PROPAGATION_TIMEOUT_SECONDS=300
+DNS_POLL_INTERVAL_SECONDS=5
+DNS_MAX_CONSECUTIVE_ERRORS=3
+
+DNS_QUERY_STATE=""
+DNS_QUERY_RECORDS=""
+DNS_QUERY_ERROR=""
+DNS_A_STATE=""
+DNS_A_RECORDS=""
+DNS_AAAA_STATE=""
+DNS_AAAA_RECORDS=""
+DNS_LAST_DETAIL=""
+DNS_LAST_ERROR=""
+
+RELAY_READY_TIMEOUT_SECONDS=15
+RELAY_READY_ERROR=""
+
+INSTALL_BACKUP_DIR=""
+INSTALL_SERVICE_WAS_ACTIVE=0
+INSTALL_TIMER_WAS_ACTIVE=0
+INSTALL_RENEW_SERVICE_WAS_ACTIVE=0
+INSTALL_SERVICE_ENABLE_STATE=""
+INSTALL_TIMER_ENABLE_STATE=""
+INSTALL_SERVICE_ACTIVE_STATE=""
+INSTALL_TIMER_ACTIVE_STATE=""
+INSTALL_RENEW_ACTIVE_STATE=""
+INSTALL_SERVICE_USER_EXISTED=0
+INSTALL_SERVICE_GROUP_EXISTED=0
+INSTALL_BASE_PREEXISTED=0
+INSTALL_CONFIG_PREEXISTED=0
+INSTALL_STATE_PREEXISTED=0
+INSTALL_BOOTSTRAP_CLEANUP_ACTIVE=0
+INSTALL_APPLY_PID=""
+INSTALL_INTERRUPTED_SIGNAL=""
+INSTALL_PROCESS_TREE_PIDS=()
+INSTALL_PROCESS_TREE_IDENTITIES=()
+
+PREVIOUS_INSTALLATION_DETECTED=0
+EXISTING_CONFIG_INVALID=0
+EXISTING_CONFIG_ERROR=""
+EXISTING_TOKEN_INVALID=0
+EXISTING_TOKEN_ERROR=""
+REUSE_EXISTING_CONFIG=0
+REBUILD_EXISTING_ENVOY_CONFIG=0
+ENVIRONMENT_ERROR=""
+
 log_info() {
     if have_gum; then
         "$GUM_BIN" log --level info -- "$*"
@@ -76,7 +124,10 @@ die() {
 }
 
 have_gum() {
-    [[ -x "$GUM_BIN" ]]
+    is_managed_dir "$BASE_DIR" \
+        && safe_root_owned_directory "${BASE_DIR}/bin" \
+        && [[ -x "$GUM_BIN" ]] \
+        && safe_root_owned_file "$GUM_BIN"
 }
 
 require_root() {
@@ -100,9 +151,14 @@ command_exists() {
 is_managed_dir() {
     local path="$1"
     local marker="${path}/${OWNERSHIP_MARKER}"
+    local path_mode marker_mode
     [[ -d "$path" && ! -L "$path" && -f "$marker" && ! -L "$marker" ]] || return 1
     [[ "$(stat -c %u "$path" 2>/dev/null)" == "0" ]] || return 1
     [[ "$(stat -c %u "$marker" 2>/dev/null)" == "0" ]] || return 1
+    path_mode="$(stat -c %a "$path" 2>/dev/null)"
+    marker_mode="$(stat -c %a "$marker" 2>/dev/null)"
+    [[ "$path_mode" =~ ^[0-7]{3,4}$ && "$marker_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$path_mode & 022) == 0 && (8#$marker_mode & 022) == 0 )) || return 1
     [[ "$(cat "$marker" 2>/dev/null)" == "$OWNERSHIP_VALUE" ]]
 }
 
@@ -116,9 +172,9 @@ claim_managed_dir() {
     if [[ ! -d "$path" ]]; then
         mkdir -p "$path"
     elif ! is_managed_dir "$path"; then
-        if find "$path" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-            die "Refusing to claim non-empty unowned directory: ${path}"
-        fi
+        die "Refusing to claim an existing unowned directory: ${path}"
+    else
+        return 0
     fi
     if [[ ! -f "$marker" ]]; then
         printf '%s\n' "$OWNERSHIP_VALUE" >"$marker"
@@ -137,13 +193,29 @@ claim_project_dirs() {
 
 remove_managed_dir() {
     local path="$1"
-    if [[ ! -e "$path" ]]; then
+    local tombstone="" attempt
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
         return 0
     fi
-    if is_managed_dir "$path"; then
-        rm -rf -- "$path"
-    else
+    if ! is_managed_dir "$path"; then
         log_warn "Preserving unowned or unsafe directory: ${path}"
+        return 1
+    fi
+    for attempt in {1..10}; do
+        tombstone="${path}.removing.$$.${RANDOM}.${attempt}"
+        [[ ! -e "$tombstone" && ! -L "$tombstone" ]] || continue
+        if mv -T -- "$path" "$tombstone"; then
+            break
+        fi
+        tombstone=""
+    done
+    if [[ -z "$tombstone" || -e "$path" || -L "$path" ]]; then
+        log_error "Could not move the managed directory out of service before removal: ${path}"
+        return 1
+    fi
+    if ! rm -rf -- "$tombstone"; then
+        log_error "The managed directory was detached but could not be fully removed: ${tombstone}"
+        return 1
     fi
 }
 
@@ -237,24 +309,91 @@ save_environment() {
     } | write_atomic "$ENV_FILE" 600
 }
 
-load_environment() {
-    [[ -f "$ENV_FILE" ]] || return 1
-    [[ ! -L "$ENV_FILE" && "$(stat -c %u "$ENV_FILE" 2>/dev/null)" == "0" ]] \
-        || die "The saved environment file is not a safe root-owned regular file."
+validate_saved_environment() {
+    ENVIRONMENT_ERROR=""
+    if [[ ! -f "$ENV_FILE" || -L "$ENV_FILE" \
+        || "$(stat -c %u "$ENV_FILE" 2>/dev/null)" != "0" ]]; then
+        ENVIRONMENT_ERROR="The saved environment file is not a safe root-owned regular file."
+        return 1
+    fi
     local env_mode
-    env_mode="$(stat -c %a "$ENV_FILE")"
-    (( (8#$env_mode & 022) == 0 )) \
-        || die "The saved environment file is writable by a non-root user."
+    env_mode="$(stat -c %a "$ENV_FILE" 2>/dev/null)"
+    if [[ ! "$env_mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$env_mode & 022) != 0 )); then
+        ENVIRONMENT_ERROR="The saved environment file is writable by a non-root user."
+        return 1
+    fi
+
+    DOMAIN=""
+    LISTEN_ADDRESS=""
+    LISTEN_PORT=""
+    ADMIN_PORT=""
+    PUBLIC_IPV4=""
+    CERT_EMAIL=""
     # The file is root-owned, mode 0600, and every value is written with shell escaping.
     # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    is_valid_domain "$DOMAIN" || die "The saved relay domain is invalid."
-    is_valid_ip "$LISTEN_ADDRESS" || die "The saved listen address is invalid."
-    is_valid_port "$LISTEN_PORT" || die "The saved listen port is invalid."
-    is_valid_port "$ADMIN_PORT" || die "The saved admin port is invalid."
-    is_valid_ipv4 "$PUBLIC_IPV4" || die "The saved public IPv4 address is invalid."
-    [[ "$CERT_EMAIL" == *@*.* && "$CERT_EMAIL" != *$'\n'* && "$CERT_EMAIL" != *$'\r'* ]] \
-        || die "The saved Let's Encrypt account email is invalid."
+    if ! source "$ENV_FILE"; then
+        ENVIRONMENT_ERROR="The saved environment file could not be parsed."
+        return 1
+    fi
+    if ! is_valid_domain "$DOMAIN"; then
+        ENVIRONMENT_ERROR="The saved relay domain is invalid."
+        return 1
+    fi
+    if ! is_valid_ip "$LISTEN_ADDRESS"; then
+        ENVIRONMENT_ERROR="The saved listen address is invalid."
+        return 1
+    fi
+    if ! is_valid_port "$LISTEN_PORT"; then
+        ENVIRONMENT_ERROR="The saved listen port is invalid."
+        return 1
+    fi
+    if ! is_valid_port "$ADMIN_PORT"; then
+        ENVIRONMENT_ERROR="The saved admin port is invalid."
+        return 1
+    fi
+    if ! is_valid_ipv4 "$PUBLIC_IPV4"; then
+        ENVIRONMENT_ERROR="The saved public IPv4 address is invalid."
+        return 1
+    fi
+    if [[ "$CERT_EMAIL" != *@*.* || "$CERT_EMAIL" == *$'\n'* || "$CERT_EMAIL" == *$'\r'* ]]; then
+        ENVIRONMENT_ERROR="The saved Let's Encrypt account email is invalid."
+        return 1
+    fi
+}
+
+load_environment() {
+    [[ -f "$ENV_FILE" ]] || return 1
+    validate_saved_environment || die "$ENVIRONMENT_ERROR"
+}
+
+validate_existing_project_configuration() {
+    local token_mode token
+    EXISTING_CONFIG_INVALID=0
+    EXISTING_CONFIG_ERROR=""
+    EXISTING_TOKEN_INVALID=0
+    EXISTING_TOKEN_ERROR=""
+    if ! validate_saved_environment; then
+        EXISTING_CONFIG_ERROR="$ENVIRONMENT_ERROR"
+        EXISTING_CONFIG_INVALID=1
+    fi
+    if [[ ! -f "$TOKEN_FILE" || -L "$TOKEN_FILE" \
+        || "$(stat -c %u "$TOKEN_FILE" 2>/dev/null)" != "0" ]]; then
+        EXISTING_TOKEN_INVALID=1
+        EXISTING_TOKEN_ERROR="The saved relay token is not a safe root-owned regular file."
+    else
+        token_mode="$(stat -c %a "$TOKEN_FILE" 2>/dev/null)"
+        if [[ ! "$token_mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$token_mode & 022) != 0 )); then
+            EXISTING_TOKEN_INVALID=1
+            EXISTING_TOKEN_ERROR="The saved relay token is writable by a non-root user."
+        else
+            token="$(tr -d '\r\n' <"$TOKEN_FILE")"
+            if [[ ! "$token" =~ ^[0-9a-f]{64}$ ]]; then
+                EXISTING_TOKEN_INVALID=1
+                EXISTING_TOKEN_ERROR="The saved relay token is missing or invalid."
+            fi
+        fi
+    fi
+    (( EXISTING_CONFIG_INVALID == 0 ))
 }
 
 choose() {
@@ -277,7 +416,7 @@ spin() {
     local title="$1"
     shift
     if [[ -t 1 ]]; then
-        "$GUM_BIN" spin --spinner dot --title "$title" -- "$@"
+        "$GUM_BIN" spin --show-error --spinner dot --title "$title" -- "$@"
     else
         "$@"
     fi
@@ -305,13 +444,18 @@ install_base_dependencies() {
 
 install_gum() {
     mkdir -p "${BASE_DIR}/bin"
-    if command_exists gum; then
-        local system_gum
-        system_gum="$(command -v gum)"
-        install -m 0755 "$system_gum" "$GUM_BIN"
+    if have_gum; then
         return 0
     fi
-    if have_gum; then
+    if [[ -e "$GUM_BIN" || -L "$GUM_BIN" ]]; then
+        die "Refusing to execute or replace an unsafe Gum binary: ${GUM_BIN}"
+    fi
+    if command_exists gum; then
+        local system_gum
+        system_gum="$(readlink -f "$(command -v gum)")"
+        safe_root_owned_file "$system_gum" \
+            || die "Refusing to copy an unsafe system Gum binary: ${system_gum}"
+        install -m 0755 "$system_gum" "$GUM_BIN"
         return 0
     fi
 
@@ -454,6 +598,8 @@ protocol, address, raw_port = sys.argv[1:]
 family = socket.AF_INET6 if ":" in address else socket.AF_INET
 kind = socket.SOCK_STREAM if protocol == "tcp" else socket.SOCK_DGRAM
 sock = socket.socket(family, kind)
+if protocol == "tcp":
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     sock.bind((address, int(raw_port)))
 except OSError as error:
@@ -492,49 +638,221 @@ detect_public_ipv4() {
     fi
 }
 
+compact_file_text() {
+    local path="$1"
+    awk '
+        NF {
+            gsub(/[[:space:]]+/, " ")
+            printf "%s%s", separator, $0
+            separator = " "
+        }
+    ' "$path"
+}
+
 query_cloudflare_dns() {
     local record_type="$1"
-    local response
-    response="$(curl -4fsS --connect-timeout 5 --max-time 15 \
+    local max_time="${2:-$DNS_QUERY_MAX_TIME_SECONDS}"
+    local connect_timeout="$DNS_QUERY_CONNECT_TIMEOUT_SECONDS"
+    local response error_file error_detail curl_status parsed
+
+    DNS_QUERY_STATE=""
+    DNS_QUERY_RECORDS=""
+    DNS_QUERY_ERROR=""
+
+    if [[ "$record_type" != "A" && "$record_type" != "AAAA" ]]; then
+        DNS_QUERY_ERROR="Unsupported DNS record type: ${record_type}."
+        return 1
+    fi
+    if ! [[ "$max_time" =~ ^[1-9][0-9]*$ ]]; then
+        DNS_QUERY_ERROR="Invalid DNS query timeout: ${max_time}."
+        return 1
+    fi
+    if (( connect_timeout > max_time )); then
+        connect_timeout="$max_time"
+    fi
+
+    if ! error_file="$(mktemp /tmp/apple-relay-dns-query.XXXXXX)"; then
+        DNS_QUERY_ERROR="Could not create a temporary file for the Cloudflare DoH query."
+        return 1
+    fi
+    if response="$(curl -4fsS \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$max_time" \
         -H 'accept: application/dns-json' \
-        "https://1.1.1.1/dns-query?name=${DOMAIN}&type=${record_type}" 2>/dev/null || true)"
-    python3 - "$record_type" "$response" <<'PY'
+        "https://1.1.1.1/dns-query?name=${DOMAIN}&type=${record_type}" \
+        2>"$error_file")"; then
+        :
+    else
+        curl_status=$?
+        error_detail="$(compact_file_text "$error_file")"
+        rm -f "$error_file"
+        DNS_QUERY_ERROR="Cloudflare DoH ${record_type} request failed (curl exit ${curl_status}): ${error_detail:-no error details}."
+        return 1
+    fi
+
+    : >"$error_file"
+    if parsed="$(python3 - "$record_type" "$response" 2>"$error_file" <<'PY'
+import ipaddress
 import json
 import sys
 
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
 record_type, raw = sys.argv[1:]
-wanted = {"A": 1, "AAAA": 28}[record_type]
 try:
     payload = json.loads(raw)
 except (TypeError, ValueError):
-    raise SystemExit(0)
+    fail("Cloudflare DoH returned invalid JSON.")
 
-if payload.get("Status") != 0:
-    raise SystemExit(0)
+if not isinstance(payload, dict):
+    fail("Cloudflare DoH returned a non-object JSON response.")
 
-for answer in payload.get("Answer", []):
-    if answer.get("type") == wanted and isinstance(answer.get("data"), str):
-        print(answer["data"])
+status = payload.get("Status")
+if type(status) is not int:
+    fail("Cloudflare DoH response is missing an integer DNS Status.")
+if status == 3:
+    print("NXDOMAIN")
+    raise SystemExit(0)
+if status != 0:
+    status_names = {
+        1: "FORMERR",
+        2: "SERVFAIL",
+        4: "NOTIMP",
+        5: "REFUSED",
+    }
+    status_name = status_names.get(status, "UNKNOWN")
+    fail(f"Cloudflare DoH returned DNS Status={status} ({status_name}).")
+
+answers = payload.get("Answer", [])
+if not isinstance(answers, list):
+    fail("Cloudflare DoH returned an invalid Answer field.")
+
+wanted_type = {"A": 1, "AAAA": 28}[record_type]
+wanted_version = {"A": 4, "AAAA": 6}[record_type]
+records = []
+for answer in answers:
+    if not isinstance(answer, dict) or answer.get("type") != wanted_type:
+        continue
+    data = answer.get("data")
+    if not isinstance(data, str):
+        fail(f"Cloudflare DoH returned an invalid {record_type} record.")
+    try:
+        address = ipaddress.ip_address(data)
+    except ValueError:
+        fail(f"Cloudflare DoH returned an invalid {record_type} address: {data}.")
+    if address.version != wanted_version:
+        fail(f"Cloudflare DoH returned the wrong address family for {record_type}: {data}.")
+    records.append(str(address))
+
+records = sorted(set(records), key=lambda value: ipaddress.ip_address(value).packed)
+print("OK" if records else "NODATA")
+for record in records:
+    print(record)
 PY
+)"; then
+        :
+    else
+        error_detail="$(compact_file_text "$error_file")"
+        rm -f "$error_file"
+        DNS_QUERY_ERROR="Cloudflare DoH ${record_type} response could not be used: ${error_detail:-unknown parser error}"
+        return 1
+    fi
+    rm -f "$error_file"
+
+    DNS_QUERY_STATE="${parsed%%$'\n'*}"
+    if [[ "$parsed" == *$'\n'* ]]; then
+        DNS_QUERY_RECORDS="${parsed#*$'\n'}"
+    fi
+    case "$DNS_QUERY_STATE" in
+        OK)
+            if [[ -z "$DNS_QUERY_RECORDS" ]]; then
+                DNS_QUERY_ERROR="Cloudflare DoH ${record_type} response reported records but contained none."
+                return 1
+            fi
+            ;;
+        NODATA|NXDOMAIN)
+            if [[ -n "$DNS_QUERY_RECORDS" ]]; then
+                DNS_QUERY_ERROR="Cloudflare DoH ${record_type} response contained inconsistent data."
+                return 1
+            fi
+            ;;
+        *)
+            DNS_QUERY_ERROR="Cloudflare DoH ${record_type} response returned an unknown parser state."
+            return 1
+            ;;
+    esac
 }
 
-resolved_a_records() {
-    query_cloudflare_dns A \
-        | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ {print}' \
-        | sort -u
+dns_now_epoch() {
+    date +%s
 }
 
-resolved_aaaa_records() {
-    query_cloudflare_dns AAAA \
-        | awk '/:/ {print}' \
-        | sort -u
+dns_timeout_before_deadline() {
+    local deadline="${1:-}"
+    local now remaining timeout="$DNS_QUERY_MAX_TIME_SECONDS"
+    if [[ -n "$deadline" ]]; then
+        now="$(dns_now_epoch)"
+        remaining=$((deadline - now))
+        (( remaining > 0 )) || return 1
+        if (( timeout > remaining )); then
+            timeout="$remaining"
+        fi
+    fi
+    printf '%s\n' "$timeout"
+}
+
+format_dns_record_state() {
+    local state="$1"
+    local records="$2"
+    case "$state" in
+        OK) printf '%s' "${records//$'\n'/,}" ;;
+        NODATA) printf 'none' ;;
+        NXDOMAIN) printf 'NXDOMAIN' ;;
+        *) printf 'unknown' ;;
+    esac
 }
 
 dns_points_to_relay() {
-    local a_records aaaa_records
-    a_records="$(resolved_a_records)"
-    aaaa_records="$(resolved_aaaa_records)"
-    [[ "$a_records" == "$PUBLIC_IPV4" && -z "$aaaa_records" ]]
+    local deadline="${1:-}"
+    local query_timeout
+
+    DNS_A_STATE=""
+    DNS_A_RECORDS=""
+    DNS_AAAA_STATE=""
+    DNS_AAAA_RECORDS=""
+    DNS_LAST_DETAIL=""
+    DNS_LAST_ERROR=""
+
+    if ! query_timeout="$(dns_timeout_before_deadline "$deadline")"; then
+        DNS_LAST_ERROR="The DNS validation deadline expired before the A query completed."
+        return 3
+    fi
+    if ! query_cloudflare_dns A "$query_timeout"; then
+        DNS_LAST_ERROR="$DNS_QUERY_ERROR"
+        return 2
+    fi
+    DNS_A_STATE="$DNS_QUERY_STATE"
+    DNS_A_RECORDS="$DNS_QUERY_RECORDS"
+
+    if ! query_timeout="$(dns_timeout_before_deadline "$deadline")"; then
+        DNS_LAST_ERROR="The DNS validation deadline expired before the AAAA query completed."
+        return 3
+    fi
+    if ! query_cloudflare_dns AAAA "$query_timeout"; then
+        DNS_LAST_ERROR="$DNS_QUERY_ERROR"
+        return 2
+    fi
+    DNS_AAAA_STATE="$DNS_QUERY_STATE"
+    DNS_AAAA_RECORDS="$DNS_QUERY_RECORDS"
+    DNS_LAST_DETAIL="A=$(format_dns_record_state "$DNS_A_STATE" "$DNS_A_RECORDS"), AAAA=$(format_dns_record_state "$DNS_AAAA_STATE" "$DNS_AAAA_RECORDS")"
+
+    [[ "$DNS_A_STATE" == "OK" \
+        && "$DNS_A_RECORDS" == "$PUBLIC_IPV4" \
+        && "$DNS_AAAA_STATE" == "NODATA" ]]
 }
 
 show_dns_instructions() {
@@ -550,24 +868,77 @@ show_dns_instructions() {
 }
 
 wait_for_dns() {
-    local attempt a_records aaaa_records
+    local start_time deadline now remaining sleep_seconds status
+    local attempt=0
+    local consecutive_errors=0
+    local last_valid_detail="no complete DNS response"
+    local last_query_error=""
     show_dns_instructions
     confirm "The DNS record is configured. Start the 1.1.1.1 propagation check?" \
         || die "DNS validation was cancelled."
 
-    for attempt in $(seq 1 60); do
-        if dns_points_to_relay; then
+    start_time="$(dns_now_epoch)"
+    deadline=$((start_time + DNS_PROPAGATION_TIMEOUT_SECONDS))
+    log_info "Checking DNS through 1.1.1.1 for up to ${DNS_PROPAGATION_TIMEOUT_SECONDS}s. Query errors will be reported immediately."
+    while true; do
+        now="$(dns_now_epoch)"
+        (( now < deadline )) || break
+        (( attempt += 1 ))
+
+        if dns_points_to_relay "$deadline"; then
             log_ok "1.1.1.1 resolves ${DOMAIN} to ${PUBLIC_IPV4} with no AAAA record."
             return 0
+        else
+            status=$?
         fi
-        if (( attempt == 1 || attempt % 6 == 0 )); then
-            a_records="$(resolved_a_records | paste -sd, -)"
-            aaaa_records="$(resolved_aaaa_records | paste -sd, -)"
-            log_info "Waiting for DNS propagation via 1.1.1.1 (A=${a_records:-none}, AAAA=${aaaa_records:-none})."
+
+        now="$(dns_now_epoch)"
+        remaining=$((deadline - now))
+        if (( remaining < 0 )); then
+            remaining=0
         fi
-        sleep 5
+
+        if (( status == 2 )); then
+            (( consecutive_errors += 1 ))
+            last_query_error="$DNS_LAST_ERROR"
+            log_warn "DNS check ${attempt} could not query 1.1.1.1: ${DNS_LAST_ERROR} Retrying (${remaining}s remaining)."
+            if (( consecutive_errors >= DNS_MAX_CONSECUTIVE_ERRORS )); then
+                die "DNS validation stopped after ${consecutive_errors} consecutive Cloudflare DoH errors. Last error: ${DNS_LAST_ERROR}"
+            fi
+        elif (( status == 3 )); then
+            break
+        else
+            consecutive_errors=0
+            last_valid_detail="$DNS_LAST_DETAIL"
+            log_info "Waiting for DNS propagation via 1.1.1.1 (attempt ${attempt}, ${remaining}s remaining; ${DNS_LAST_DETAIL})."
+        fi
+
+        (( remaining > 0 )) || break
+        sleep_seconds="$DNS_POLL_INTERVAL_SECONDS"
+        if (( sleep_seconds > remaining )); then
+            sleep_seconds="$remaining"
+        fi
+        sleep "$sleep_seconds"
     done
-    die "DNS validation timed out. 1.1.1.1 must return only A=${PUBLIC_IPV4} for ${DOMAIN}, with no AAAA record."
+
+    if [[ "$last_valid_detail" != "no complete DNS response" ]]; then
+        die "DNS validation timed out after ${DNS_PROPAGATION_TIMEOUT_SECONDS}s. Expected only A=${PUBLIC_IPV4} for ${DOMAIN} with no AAAA record; last answer was ${last_valid_detail}."
+    fi
+    die "DNS validation timed out after ${DNS_PROPAGATION_TIMEOUT_SECONDS}s without a complete DNS response. Last query error: ${last_query_error:-deadline expired}."
+}
+
+require_dns_points_to_relay() {
+    local action="$1"
+    local status
+    if dns_points_to_relay; then
+        return 0
+    else
+        status=$?
+    fi
+    if (( status == 2 )); then
+        die "${action} was not attempted because the Cloudflare DoH check failed: ${DNS_LAST_ERROR}"
+    fi
+    die "${action} was not attempted. Expected only A=${PUBLIC_IPV4} for ${DOMAIN} with no AAAA record; received ${DNS_LAST_DETAIL:-no complete DNS response}."
 }
 
 certificate_matches_key() {
@@ -653,16 +1024,22 @@ ensure_letsencrypt_certificate() {
     local deployed_private_key="${TLS_DIR}/privkey.pem"
     local lineage="${LETSENCRYPT_LIVE_DIR}/${DOMAIN}"
 
-    if validate_certificate_pair "$deployed_certificate" "$deployed_private_key"; then
+    if validate_certificate_pair "${lineage}/fullchain.pem" "${lineage}/privkey.pem"; then
         install_certbot
-        log_info "The deployed certificate is valid and within its validity period; it will be reused."
+        if ! validate_certificate_pair "$deployed_certificate" "$deployed_private_key" \
+            || [[ "$(sha256_file "$deployed_certificate")" \
+                    != "$(sha256_file "${lineage}/fullchain.pem")" ]] \
+            || [[ "$(sha256_file "$deployed_private_key")" \
+                    != "$(sha256_file "${lineage}/privkey.pem")" ]]; then
+            copy_letsencrypt_lineage
+        fi
+        log_info "The existing Let's Encrypt certificate is valid and within its validity period; it will be reused."
         return 0
     fi
 
-    if validate_certificate_pair "${lineage}/fullchain.pem" "${lineage}/privkey.pem"; then
-        install_certbot
-        copy_letsencrypt_lineage
-        log_info "The existing Let's Encrypt certificate is valid and within its validity period; it will be reused."
+    if validate_certificate_pair "$deployed_certificate" "$deployed_private_key"; then
+        log_warn "The deployed certificate is valid, but no renewable Certbot lineage is available; requesting a managed Let's Encrypt certificate."
+        issue_letsencrypt_certificate
         return 0
     fi
 
@@ -686,6 +1063,7 @@ issue_letsencrypt_certificate() {
 }
 
 render_envoy_config() {
+    local destination="${1:-$ENVOY_CONFIG}"
     local token
     token="$(tr -d '\r\n' <"$TOKEN_FILE")"
     [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die "The relay token is missing or invalid."
@@ -781,10 +1159,10 @@ static_resources:
           name: relay_dns_cache
           dns_lookup_family: V4_PREFERRED
 EOF
-    } | write_atomic "$ENVOY_CONFIG" 600
+    } | write_atomic "$destination" 600
     if id -u "$SERVICE_USER" >/dev/null 2>&1; then
-        chown "root:${SERVICE_USER}" "$ENVOY_CONFIG"
-        chmod 0640 "$ENVOY_CONFIG"
+        chown "root:${SERVICE_USER}" "$destination"
+        chmod 0640 "$destination"
     fi
 }
 
@@ -792,7 +1170,8 @@ validate_envoy_config() {
     [[ -x "$ENVOY_BIN" ]] || die "The Envoy binary is missing."
     local validation_log
     validation_log="$(mktemp /tmp/apple-relay-envoy-validate.XXXXXX)"
-    if ! "$ENVOY_BIN" --mode validate -c "$ENVOY_CONFIG" >"$validation_log" 2>&1; then
+    if ! "$ENVOY_BIN" --mode validate --disable-hot-restart \
+        -c "$ENVOY_CONFIG" >"$validation_log" 2>&1; then
         cat "$validation_log" >&2
         rm -f "$validation_log"
         return 1
@@ -800,16 +1179,186 @@ validate_envoy_config() {
     rm -f "$validation_log"
 }
 
-wait_for_relay_ready() {
-    local attempt
-    for attempt in $(seq 1 50); do
-        if curl -fsS --connect-timeout 1 --max-time 2 \
-            "http://127.0.0.1:${ADMIN_PORT}/ready" 2>/dev/null | grep -qx 'LIVE'; then
-            return 0
+existing_envoy_config_matches_inputs() {
+    local temporary expected_config match_status=1
+    temporary="$(mktemp -d /tmp/apple-relay-envoy-compare.XXXXXX)" || return 1
+    expected_config="${temporary}/envoy.yaml"
+    if render_envoy_config "$expected_config" \
+        && [[ "$(sha256_file "$expected_config")" == "$(sha256_file "$ENVOY_CONFIG")" ]]; then
+        match_status=0
+    fi
+    rm -rf -- "$temporary"
+    return "$match_status"
+}
+
+assess_existing_configuration() {
+    local validation_log
+    REUSE_EXISTING_CONFIG=0
+    REBUILD_EXISTING_ENVOY_CONFIG=0
+
+    if ! validate_existing_project_configuration; then
+        if (( EXISTING_TOKEN_INVALID == 1 )); then
+            log_warn "${EXISTING_TOKEN_ERROR} A new token will be generated."
         fi
-        systemctl is-failed --quiet apple-relay.service 2>/dev/null && return 1
+        return 1
+    fi
+    if [[ "$LISTEN_ADDRESS" != "0.0.0.0" || "$LISTEN_PORT" != "443" ]]; then
+        EXISTING_CONFIG_INVALID=1
+        EXISTING_CONFIG_ERROR="The saved listener ${LISTEN_ADDRESS}:${LISTEN_PORT} is incompatible with the required 0.0.0.0:443 listener."
+        return 1
+    fi
+    REUSE_EXISTING_CONFIG=1
+
+    if (( EXISTING_TOKEN_INVALID == 1 )); then
+        log_warn "${EXISTING_TOKEN_ERROR} A new token will be generated; existing client profiles will need to be updated."
+        REBUILD_EXISTING_ENVOY_CONFIG=1
+    fi
+    if ! validate_certificate_pair "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem"; then
+        log_warn "The deployed TLS certificate is missing or invalid and will be repaired without discarding the other configuration."
+    fi
+
+    if [[ -e "$ENVOY_CONFIG" || -L "$ENVOY_CONFIG" ]] \
+        && ! safe_root_owned_file "$ENVOY_CONFIG"; then
+        die "Refusing an unsafe generated Envoy configuration path: ${ENVOY_CONFIG}"
+    fi
+    if (( EXISTING_TOKEN_INVALID == 0 )) && [[ -f "$ENVOY_CONFIG" ]] \
+        && ! existing_envoy_config_matches_inputs; then
+        REBUILD_EXISTING_ENVOY_CONFIG=1
+        log_warn "The generated Envoy configuration does not match the saved token or network settings and will be rebuilt."
+        return 0
+    fi
+    if [[ ! -f "$ENVOY_CONFIG" ]] \
+        || ! safe_root_owned_file "$ENVOY_BIN" || [[ ! -x "$ENVOY_BIN" ]]; then
+        REBUILD_EXISTING_ENVOY_CONFIG=1
+        log_warn "The generated Envoy configuration cannot be validated and will be rebuilt."
+        return 0
+    fi
+    if ! validation_log="$(mktemp /tmp/apple-relay-existing-envoy-validate.XXXXXX)"; then
+        REBUILD_EXISTING_ENVOY_CONFIG=1
+        log_warn "A temporary validation file could not be created; the generated Envoy configuration will be rebuilt."
+        return 0
+    fi
+    if ! "$ENVOY_BIN" --mode validate --disable-hot-restart \
+        -c "$ENVOY_CONFIG" >"$validation_log" 2>&1; then
+        log_warn "The generated Envoy configuration failed validation and will be rebuilt: $(compact_file_text "$validation_log")"
+        REBUILD_EXISTING_ENVOY_CONFIG=1
+    fi
+    rm -f "$validation_log"
+}
+
+wait_for_relay_ready() {
+    local start_time deadline now response error_file error_detail curl_status active_state sub_state
+    local consecutive_ready_checks=0
+    RELAY_READY_ERROR=""
+    if ! error_file="$(mktemp /tmp/apple-relay-ready.XXXXXX)"; then
+        RELAY_READY_ERROR="Could not create a temporary file for the readiness check."
+        return 1
+    fi
+    start_time="$(date +%s)"
+    deadline=$((start_time + RELAY_READY_TIMEOUT_SECONDS))
+
+    while true; do
+        : >"$error_file"
+        if response="$(curl -sS --connect-timeout 1 --max-time 1 \
+            "http://127.0.0.1:${ADMIN_PORT}/ready" 2>"$error_file")"; then
+            if [[ "$response" == "LIVE" ]]; then
+                active_state="$(systemctl show apple-relay.service --property=ActiveState --value 2>/dev/null || true)"
+                sub_state="$(systemctl show apple-relay.service --property=SubState --value 2>/dev/null || true)"
+                if [[ "$active_state" == "active" && "$sub_state" == "running" ]]; then
+                    (( consecutive_ready_checks += 1 ))
+                    if (( consecutive_ready_checks >= 2 )); then
+                        rm -f "$error_file"
+                        RELAY_READY_ERROR=""
+                        return 0
+                    fi
+                    RELAY_READY_ERROR="Envoy reported LIVE once; waiting for a stable second check."
+                else
+                    consecutive_ready_checks=0
+                    RELAY_READY_ERROR="Envoy reported LIVE, but systemd state is '${active_state:-unknown}/${sub_state:-unknown}'."
+                fi
+            else
+                consecutive_ready_checks=0
+                response="${response//$'\r'/ }"
+                response="${response//$'\n'/ }"
+                RELAY_READY_ERROR="The Envoy readiness endpoint returned '${response:0:200}'."
+            fi
+        else
+            consecutive_ready_checks=0
+            curl_status=$?
+            error_detail="$(compact_file_text "$error_file")"
+            RELAY_READY_ERROR="The Envoy readiness endpoint could not be reached (curl exit ${curl_status}): ${error_detail:-no error details}."
+        fi
+
+        if systemctl is-failed --quiet apple-relay.service 2>/dev/null; then
+            RELAY_READY_ERROR="The systemd service entered the failed state. ${RELAY_READY_ERROR}"
+            rm -f "$error_file"
+            return 1
+        fi
+        sub_state="$(systemctl show apple-relay.service --property=SubState --value 2>/dev/null || true)"
+        if [[ "$sub_state" == "auto-restart" || "$sub_state" == "failed" ]]; then
+            RELAY_READY_ERROR="The systemd service entered '${sub_state}'. ${RELAY_READY_ERROR}"
+            rm -f "$error_file"
+            return 1
+        fi
+
+        now="$(date +%s)"
+        if (( now >= deadline )); then
+            RELAY_READY_ERROR="Envoy did not report LIVE within ${RELAY_READY_TIMEOUT_SECONDS}s. ${RELAY_READY_ERROR}"
+            rm -f "$error_file"
+            return 1
+        fi
         sleep 0.2
     done
+}
+
+relay_journal_cursor() {
+    journalctl -n 1 --show-cursor --no-pager 2>/dev/null \
+        | sed -n 's/^-- cursor: //p' \
+        | tail -n 1
+}
+
+show_relay_journal_since() {
+    local cursor="$1"
+    local since="$2"
+    if [[ -n "$cursor" ]]; then
+        if journalctl -u apple-relay.service --after-cursor="$cursor" --no-pager >&2; then
+            return 0
+        fi
+        log_warn "Could not read the service journal by cursor; falling back to a timestamp."
+    fi
+    if ! journalctl -u apple-relay.service --since="$since" --no-pager >&2; then
+        log_warn "Could not read the Apple Relay service journal."
+    fi
+}
+
+restart_relay_service() {
+    local cursor since restart_status failure_reason active_state sub_state
+    local restart_succeeded=0
+    cursor="$(relay_journal_cursor || true)"
+    since="$(date --iso-8601=seconds)"
+    systemctl reset-failed apple-relay.service >/dev/null 2>&1 || true
+
+    if systemctl restart apple-relay.service; then
+        restart_succeeded=1
+        if wait_for_relay_ready; then
+            return 0
+        fi
+        failure_reason="Apple Relay did not become ready. ${RELAY_READY_ERROR}"
+    else
+        restart_status=$?
+        failure_reason="systemctl could not restart Apple Relay (exit ${restart_status})."
+    fi
+
+    log_error "$failure_reason"
+    active_state="$(systemctl show apple-relay.service --property=ActiveState --value 2>/dev/null || true)"
+    sub_state="$(systemctl show apple-relay.service --property=SubState --value 2>/dev/null || true)"
+    if (( restart_succeeded == 1 )) \
+        || [[ "$active_state" == "failed" || "$sub_state" == "auto-restart" ]]; then
+        if ! systemctl stop apple-relay.service; then
+            log_warn "Apple Relay could not be stopped after the failed start."
+        fi
+    fi
+    show_relay_journal_since "$cursor" "$since"
     return 1
 }
 
@@ -820,12 +1369,14 @@ install_systemd_units() {
 Description=Apple Network Relay (Envoy MASQUE)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
-ExecStart=${ENVOY_BIN} -c ${ENVOY_CONFIG} --log-level info
+ExecStart=${ENVOY_BIN} -c ${ENVOY_CONFIG} --log-level info --disable-hot-restart
 Restart=on-failure
 RestartSec=3s
 TimeoutStartSec=120s
@@ -883,8 +1434,736 @@ EOF
     } | write_atomic "$RENEW_TIMER_UNIT" 644
 
     systemctl daemon-reload
+    assert_no_project_unit_dropins \
+        || die "The Apple Relay units have unrecognized systemd drop-ins."
     systemctl enable apple-relay.service >/dev/null
-    systemctl enable --now apple-relay-renew.timer >/dev/null
+}
+
+systemd_unit_property() {
+    local unit_name="$1"
+    local property_name="$2"
+    local output
+    if output="$(systemctl show "$unit_name" --property="$property_name" --value 2>&1)"; then
+        printf '%s\n' "$output"
+        return 0
+    fi
+    output="${output//$'\r'/ }"
+    output="${output//$'\n'/ }"
+    log_error "Could not query systemd property ${property_name} for ${unit_name}: ${output:-no error details}"
+    return 1
+}
+
+systemd_effective_active_state() {
+    local unit_name="$1"
+    local load_state active_state
+    load_state="$(systemd_unit_property "$unit_name" LoadState)" || return 1
+    if [[ "$load_state" == "not-found" ]]; then
+        printf 'inactive\n'
+        return 0
+    fi
+    active_state="$(systemd_unit_property "$unit_name" ActiveState)" || return 1
+    if [[ -z "$active_state" ]]; then
+        log_error "systemd returned an empty ActiveState for ${unit_name}."
+        return 1
+    fi
+    printf '%s\n' "$active_state"
+}
+
+assert_no_project_unit_dropins() {
+    local unit_name dropin_paths
+    for unit_name in apple-relay.service apple-relay-renew.service apple-relay-renew.timer; do
+        dropin_paths="$(systemd_unit_property "$unit_name" DropInPaths)" \
+            || return 1
+        if [[ -n "$dropin_paths" ]]; then
+            log_error "Refusing ${unit_name} because systemd applies unrecognized drop-ins: ${dropin_paths}"
+            return 1
+        fi
+    done
+}
+
+safe_root_owned_file() {
+    local path="$1"
+    local mode
+    [[ -f "$path" && ! -L "$path" \
+        && "$(stat -c %u "$path" 2>/dev/null)" == "0" ]] || return 1
+    mode="$(stat -c %a "$path" 2>/dev/null)"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 ))
+}
+
+safe_root_owned_directory() {
+    local path="$1"
+    local mode
+    [[ -d "$path" && ! -L "$path" \
+        && "$(stat -c %u "$path" 2>/dev/null)" == "0" ]] || return 1
+    mode="$(stat -c %a "$path" 2>/dev/null)"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 ))
+}
+
+assert_existing_tls_layout_safe() {
+    local path
+    if [[ -e "$TLS_DIR" || -L "$TLS_DIR" ]]; then
+        safe_root_owned_directory "$TLS_DIR" \
+            || die "Refusing an unsafe TLS configuration directory: ${TLS_DIR}"
+    fi
+    for path in "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem"; do
+        if [[ -e "$path" || -L "$path" ]]; then
+            safe_root_owned_file "$path" \
+                || die "Refusing an unsafe TLS configuration file: ${path}"
+        fi
+    done
+}
+
+project_unit_is_owned() {
+    local path="$1"
+    safe_root_owned_file "$path" || return 1
+    case "$path" in
+        "$SERVICE_UNIT")
+            grep -Fqx 'Description=Apple Network Relay (Envoy MASQUE)' "$path" \
+                && grep -Fqx "User=${SERVICE_USER}" "$path" \
+                && grep -Fqx "Group=${SERVICE_USER}" "$path" \
+                && { grep -Fqx "ExecStart=${ENVOY_BIN} -c ${ENVOY_CONFIG} --log-level info" "$path" \
+                    || grep -Fqx "ExecStart=${ENVOY_BIN} -c ${ENVOY_CONFIG} --log-level info --disable-hot-restart" "$path"; }
+            ;;
+        "$RENEW_SERVICE_UNIT")
+            grep -Fqx 'Description=Renew the Apple Relay TLS certificate' "$path" \
+                && grep -Fqx "ExecStart=${LAUNCHER_PATH} renew-cert --quiet" "$path"
+            ;;
+        "$RENEW_TIMER_UNIT")
+            grep -Fqx 'Description=Daily Apple Relay TLS certificate renewal check' "$path" \
+                && grep -Fqx 'OnCalendar=daily' "$path" \
+                && grep -Fqx 'Persistent=true' "$path"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+launcher_is_owned() {
+    safe_root_owned_file "$LAUNCHER_PATH" || return 1
+    grep -Fqx "BACKEND=\"${BACKEND_PATH}\"" "$LAUNCHER_PATH"
+}
+
+detect_previous_installation() {
+    PREVIOUS_INSTALLATION_DETECTED=0
+    local unit_path dropin_dir fragment_path dropin_paths load_state index
+    local unit_names=(apple-relay.service apple-relay-renew.service apple-relay-renew.timer)
+    local unit_paths=("$SERVICE_UNIT" "$RENEW_SERVICE_UNIT" "$RENEW_TIMER_UNIT")
+    for index in "${!unit_names[@]}"; do
+        load_state="$(systemd_unit_property "${unit_names[$index]}" LoadState)" \
+            || die "Could not inspect ${unit_names[$index]}."
+        [[ -n "$load_state" ]] \
+            || die "systemd returned an empty LoadState for ${unit_names[$index]}."
+        if [[ "$load_state" != "not-found" ]]; then
+            fragment_path="$(systemd_unit_property "${unit_names[$index]}" FragmentPath)" \
+                || die "Could not inspect ${unit_names[$index]}."
+            dropin_paths="$(systemd_unit_property "${unit_names[$index]}" DropInPaths)" \
+                || die "Could not inspect ${unit_names[$index]}."
+            if [[ -n "$dropin_paths" ]]; then
+                die "Refusing to replace ${unit_names[$index]} with active systemd drop-ins: ${dropin_paths}"
+            fi
+            [[ -n "$fragment_path" ]] \
+                || die "Refusing a loaded ${unit_names[$index]} without a persistent unit file."
+            if [[ "$(readlink -f "$fragment_path" 2>/dev/null || printf '%s' "$fragment_path")" \
+                    != "$(readlink -f "${unit_paths[$index]}" 2>/dev/null || printf '%s' "${unit_paths[$index]}")" ]]; then
+                die "Refusing to manage ${unit_names[$index]} from an unexpected path: ${fragment_path}"
+            fi
+        fi
+    done
+    for dropin_dir in "${SERVICE_UNIT}.d" "${RENEW_SERVICE_UNIT}.d" "${RENEW_TIMER_UNIT}.d"; do
+        if [[ -e "$dropin_dir" || -L "$dropin_dir" ]]; then
+            [[ -d "$dropin_dir" && ! -L "$dropin_dir" ]] \
+                || die "Refusing an unsafe systemd drop-in path: ${dropin_dir}"
+            if find "$dropin_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+                die "Refusing to replace a unit with unrecognized systemd drop-ins: ${dropin_dir}"
+            fi
+        fi
+    done
+    for unit_path in "$SERVICE_UNIT" "$RENEW_SERVICE_UNIT" "$RENEW_TIMER_UNIT"; do
+        if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+            project_unit_is_owned "$unit_path" \
+                || die "Refusing to replace an unrecognized systemd unit: ${unit_path}"
+            PREVIOUS_INSTALLATION_DETECTED=1
+        fi
+    done
+    if [[ -e "$LAUNCHER_PATH" || -L "$LAUNCHER_PATH" ]]; then
+        launcher_is_owned \
+            || die "Refusing to replace an unrecognized command: ${LAUNCHER_PATH}"
+        PREVIOUS_INSTALLATION_DETECTED=1
+    fi
+    if [[ -e "$BASE_DIR" ]]; then
+        is_managed_dir "$BASE_DIR" \
+            || die "Refusing to replace an unowned runtime directory: ${BASE_DIR}"
+        if find "$BASE_DIR" -mindepth 1 -maxdepth 1 ! -name "$OWNERSHIP_MARKER" -print -quit \
+            | grep -q .; then
+            PREVIOUS_INSTALLATION_DETECTED=1
+        fi
+    fi
+}
+
+disable_previous_unit() {
+    local unit_name="$1"
+    local previous_state="$2"
+    case "$previous_state" in
+        not-found) return 0 ;;
+        enabled-runtime) systemctl disable --runtime "$unit_name" ;;
+        enabled|disabled) systemctl disable "$unit_name" ;;
+        *)
+            log_error "Cannot disable ${unit_name} from unsupported state '${previous_state:-empty}'."
+            return 1
+            ;;
+    esac
+}
+
+remove_previous_runtime_installation() {
+    (( PREVIOUS_INSTALLATION_DETECTED == 1 )) || return 0
+    local service_state renew_state timer_state
+    log_info "Removing the previous Apple Relay runtime. Configuration will be preserved unless validation failed."
+
+    if ! disable_previous_unit apple-relay.service "$INSTALL_SERVICE_ENABLE_STATE"; then
+        log_error "The previous Apple Relay service could not be disabled."
+        return 1
+    fi
+    if ! disable_previous_unit apple-relay-renew.timer "$INSTALL_TIMER_ENABLE_STATE"; then
+        log_error "The previous Apple Relay timer could not be disabled."
+        return 1
+    fi
+    if ! systemctl stop apple-relay-renew.timer apple-relay-renew.service apple-relay.service; then
+        log_warn "systemctl reported an error while stopping the previous runtime; verifying the final state."
+    fi
+    service_state="$(systemd_effective_active_state apple-relay.service)" || return 1
+    renew_state="$(systemd_effective_active_state apple-relay-renew.service)" || return 1
+    timer_state="$(systemd_effective_active_state apple-relay-renew.timer)" || return 1
+    if [[ "$service_state" != "inactive" && "$service_state" != "failed" ]] \
+        || [[ "$renew_state" != "inactive" && "$renew_state" != "failed" ]] \
+        || [[ "$timer_state" != "inactive" && "$timer_state" != "failed" ]]; then
+        log_error "The previous Apple Relay services could not be stopped safely."
+        return 1
+    fi
+
+    if ! rm -f -- "$SERVICE_UNIT" "$RENEW_SERVICE_UNIT" "$RENEW_TIMER_UNIT"; then
+        log_error "The previous systemd unit files could not be removed."
+        return 1
+    fi
+    if [[ -e "$LAUNCHER_PATH" || -L "$LAUNCHER_PATH" ]]; then
+        launcher_is_owned || {
+            log_error "The relayctl launcher changed after validation; refusing to remove it."
+            return 1
+        }
+        if ! rm -f -- "$LAUNCHER_PATH"; then
+            log_error "The previous relayctl launcher could not be removed."
+            return 1
+        fi
+    fi
+    if [[ -e "$BASE_DIR" ]]; then
+        is_managed_dir "$BASE_DIR" || {
+            log_error "The runtime directory changed after validation; refusing to remove it."
+            return 1
+        }
+        if ! remove_managed_dir "$BASE_DIR"; then
+            log_error "The previous runtime directory could not be removed."
+            return 1
+        fi
+    fi
+    if ! systemctl daemon-reload; then
+        log_error "systemd could not reload after removing the previous runtime."
+        return 1
+    fi
+    log_ok "The previous runtime was removed safely."
+}
+
+prepare_runtime_installation() {
+    remove_previous_runtime_installation || return 1
+    if (( EXISTING_CONFIG_INVALID == 1 )); then
+        log_warn "Replacing only relay.env because environment validation failed: ${EXISTING_CONFIG_ERROR}"
+        if ! rm -f -- "$ENV_FILE"; then
+            log_error "The invalid relay.env file could not be removed."
+            return 1
+        fi
+    fi
+    if (( EXISTING_TOKEN_INVALID == 1 )); then
+        if ! rm -f -- "$TOKEN_FILE"; then
+            log_error "The invalid relay token could not be removed."
+            return 1
+        fi
+    fi
+    claim_project_dirs
+    install_gum
+    publish_manager
+    install_envoy
+    if (( PREVIOUS_INSTALLATION_DETECTED == 1 )); then
+        preflight_ports "" ""
+    fi
+}
+
+backup_install_path() {
+    local source="$1"
+    local destination="$2"
+    if [[ -e "$source" || -L "$source" ]]; then
+        cp -a -- "$source" "$destination"
+    fi
+}
+
+cleanup_install_backup() {
+    if [[ -z "$INSTALL_BACKUP_DIR" ]]; then
+        return 0
+    fi
+    if [[ "$INSTALL_BACKUP_DIR" != /tmp/apple-relay-install-backup.* \
+        || ! -d "$INSTALL_BACKUP_DIR" || -L "$INSTALL_BACKUP_DIR" ]]; then
+        log_warn "Refusing to remove an unexpected installation backup path: ${INSTALL_BACKUP_DIR}"
+        return 1
+    fi
+    if ! rm -rf -- "$INSTALL_BACKUP_DIR"; then
+        log_error "Could not remove the installation backup: ${INSTALL_BACKUP_DIR}"
+        return 1
+    fi
+    INSTALL_BACKUP_DIR=""
+}
+
+resume_preinstall_renewal_state() {
+    local resume_failed=0
+    if (( INSTALL_RENEW_SERVICE_WAS_ACTIVE == 1 )); then
+        systemctl start apple-relay-renew.service || resume_failed=1
+    fi
+    if (( INSTALL_TIMER_WAS_ACTIVE == 1 )); then
+        systemctl start apple-relay-renew.timer || resume_failed=1
+    fi
+    return "$resume_failed"
+}
+
+read_preinstall_systemd_state() {
+    local service_load timer_load renew_load
+    service_load="$(systemd_unit_property apple-relay.service LoadState)" || return 1
+    timer_load="$(systemd_unit_property apple-relay-renew.timer LoadState)" || return 1
+    renew_load="$(systemd_unit_property apple-relay-renew.service LoadState)" || return 1
+
+    if [[ "$service_load" == "not-found" ]]; then
+        INSTALL_SERVICE_ACTIVE_STATE="inactive"
+        INSTALL_SERVICE_ENABLE_STATE="not-found"
+    else
+        INSTALL_SERVICE_ACTIVE_STATE="$(systemd_unit_property apple-relay.service ActiveState)" \
+            || return 1
+        INSTALL_SERVICE_ENABLE_STATE="$(systemd_unit_property apple-relay.service UnitFileState)" \
+            || return 1
+    fi
+    if [[ "$timer_load" == "not-found" ]]; then
+        INSTALL_TIMER_ACTIVE_STATE="inactive"
+        INSTALL_TIMER_ENABLE_STATE="not-found"
+    else
+        INSTALL_TIMER_ACTIVE_STATE="$(systemd_unit_property apple-relay-renew.timer ActiveState)" \
+            || return 1
+        INSTALL_TIMER_ENABLE_STATE="$(systemd_unit_property apple-relay-renew.timer UnitFileState)" \
+            || return 1
+    fi
+    if [[ "$renew_load" == "not-found" ]]; then
+        INSTALL_RENEW_ACTIVE_STATE="inactive"
+    else
+        INSTALL_RENEW_ACTIVE_STATE="$(systemd_unit_property apple-relay-renew.service ActiveState)" \
+            || return 1
+    fi
+
+    case "$INSTALL_SERVICE_ACTIVE_STATE" in
+        active) INSTALL_SERVICE_WAS_ACTIVE=1 ;;
+        inactive|failed) INSTALL_SERVICE_WAS_ACTIVE=0 ;;
+        *) log_error "Apple Relay service is in a transitional state: ${INSTALL_SERVICE_ACTIVE_STATE}"; return 1 ;;
+    esac
+    case "$INSTALL_TIMER_ACTIVE_STATE" in
+        active) INSTALL_TIMER_WAS_ACTIVE=1 ;;
+        inactive|failed) INSTALL_TIMER_WAS_ACTIVE=0 ;;
+        *) log_error "Apple Relay timer is in a transitional state: ${INSTALL_TIMER_ACTIVE_STATE}"; return 1 ;;
+    esac
+    case "$INSTALL_RENEW_ACTIVE_STATE" in
+        active|activating) INSTALL_RENEW_SERVICE_WAS_ACTIVE=1 ;;
+        inactive|failed) INSTALL_RENEW_SERVICE_WAS_ACTIVE=0 ;;
+        *) log_error "Apple Relay renewal job is in an unexpected state: ${INSTALL_RENEW_ACTIVE_STATE}"; return 1 ;;
+    esac
+    case "$INSTALL_SERVICE_ENABLE_STATE" in
+        enabled|enabled-runtime|disabled|not-found) ;;
+        *) log_error "Unsupported Apple Relay unit-file state: ${INSTALL_SERVICE_ENABLE_STATE:-empty}"; return 1 ;;
+    esac
+    case "$INSTALL_TIMER_ENABLE_STATE" in
+        enabled|enabled-runtime|disabled|not-found) ;;
+        *) log_error "Unsupported Apple Relay timer unit-file state: ${INSTALL_TIMER_ENABLE_STATE:-empty}"; return 1 ;;
+    esac
+}
+
+snapshot_install_state() {
+    INSTALL_SERVICE_WAS_ACTIVE=0
+    INSTALL_TIMER_WAS_ACTIVE=0
+    INSTALL_RENEW_SERVICE_WAS_ACTIVE=0
+    INSTALL_SERVICE_ENABLE_STATE=""
+    INSTALL_TIMER_ENABLE_STATE=""
+    INSTALL_SERVICE_ACTIVE_STATE=""
+    INSTALL_TIMER_ACTIVE_STATE=""
+    INSTALL_RENEW_ACTIVE_STATE=""
+    INSTALL_SERVICE_USER_EXISTED=0
+    INSTALL_SERVICE_GROUP_EXISTED=0
+    if id -u "$SERVICE_USER" >/dev/null 2>&1; then
+        INSTALL_SERVICE_USER_EXISTED=1
+    fi
+    if getent group "$SERVICE_USER" >/dev/null 2>&1; then
+        INSTALL_SERVICE_GROUP_EXISTED=1
+    fi
+    read_preinstall_systemd_state || return 1
+
+    if (( INSTALL_TIMER_WAS_ACTIVE == 1 || INSTALL_RENEW_SERVICE_WAS_ACTIVE == 1 )); then
+        if ! systemctl stop apple-relay-renew.timer apple-relay-renew.service; then
+            log_warn "systemctl reported an error while pausing certificate renewal; verifying the final state."
+        fi
+        INSTALL_TIMER_ACTIVE_STATE="$(systemd_unit_property apple-relay-renew.timer ActiveState)" \
+            || { resume_preinstall_renewal_state || true; return 1; }
+        INSTALL_RENEW_ACTIVE_STATE="$(systemd_unit_property apple-relay-renew.service ActiveState)" \
+            || { resume_preinstall_renewal_state || true; return 1; }
+    fi
+    if [[ "$INSTALL_TIMER_ACTIVE_STATE" != "inactive" \
+        && "$INSTALL_TIMER_ACTIVE_STATE" != "failed" ]] \
+        || [[ "$INSTALL_RENEW_ACTIVE_STATE" != "inactive" \
+            && "$INSTALL_RENEW_ACTIVE_STATE" != "failed" ]]; then
+        log_error "Could not pause certificate renewal before creating the rollback snapshot."
+        resume_preinstall_renewal_state || true
+        return 1
+    fi
+
+    if ! INSTALL_BACKUP_DIR="$(mktemp -d /tmp/apple-relay-install-backup.XXXXXX)"; then
+        INSTALL_BACKUP_DIR=""
+        resume_preinstall_renewal_state || true
+        return 1
+    fi
+    if ! backup_install_path "$CONFIG_DIR" "${INSTALL_BACKUP_DIR}/config" \
+        || ! backup_install_path "$BASE_DIR" "${INSTALL_BACKUP_DIR}/base" \
+        || ! backup_install_path "$STATE_DIR" "${INSTALL_BACKUP_DIR}/state" \
+        || ! backup_install_path "$LAUNCHER_PATH" "${INSTALL_BACKUP_DIR}/relayctl-launcher" \
+        || ! backup_install_path "$SERVICE_UNIT" "${INSTALL_BACKUP_DIR}/apple-relay.service" \
+        || ! backup_install_path "$RENEW_SERVICE_UNIT" "${INSTALL_BACKUP_DIR}/apple-relay-renew.service" \
+        || ! backup_install_path "$RENEW_TIMER_UNIT" "${INSTALL_BACKUP_DIR}/apple-relay-renew.timer"; then
+        cleanup_install_backup || true
+        resume_preinstall_renewal_state || true
+        return 1
+    fi
+}
+
+restore_install_file() {
+    local backup="$1"
+    local destination="$2"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        rm -f -- "$destination" || return 1
+    fi
+    if [[ -e "$backup" || -L "$backup" ]]; then
+        cp -a -- "$backup" "$destination" || return 1
+    fi
+}
+
+restore_unit_enable_state() {
+    local unit_name="$1"
+    local previous_state="$2"
+    local current_state
+    case "$previous_state" in
+        enabled)
+            systemctl enable "$unit_name" >/dev/null || return 1
+            current_state="$(systemd_unit_property "$unit_name" UnitFileState)" || return 1
+            [[ "$current_state" == "enabled" ]]
+            ;;
+        enabled-runtime)
+            systemctl enable --runtime "$unit_name" >/dev/null || return 1
+            current_state="$(systemd_unit_property "$unit_name" UnitFileState)" || return 1
+            [[ "$current_state" == "enabled-runtime" ]]
+            ;;
+        disabled)
+            systemctl disable "$unit_name" >/dev/null 2>&1 || true
+            current_state="$(systemd_unit_property "$unit_name" UnitFileState)" || return 1
+            [[ "$current_state" == "disabled" ]]
+            ;;
+        not-found)
+            systemctl disable "$unit_name" >/dev/null 2>&1 || true
+            current_state="$(systemd_unit_property "$unit_name" LoadState)" || return 1
+            [[ "$current_state" == "not-found" ]]
+            ;;
+        *)
+            log_error "Unsupported previous enable state '${previous_state:-empty}' for ${unit_name}."
+            return 1
+            ;;
+    esac
+}
+
+remove_new_install_directory() {
+    local path="$1"
+    local existed_before="$2"
+    local label="$3"
+    (( existed_before == 0 )) || return 0
+    [[ -e "$path" || -L "$path" ]] || return 0
+    if ! is_managed_dir "$path"; then
+        log_error "The newly created ${label} directory is no longer safely managed: ${path}"
+        return 1
+    fi
+    remove_managed_dir "$path"
+}
+
+cleanup_install_bootstrap_on_exit() {
+    (( INSTALL_BOOTSTRAP_CLEANUP_ACTIVE == 1 )) || return 0
+    INSTALL_BOOTSTRAP_CLEANUP_ACTIVE=0
+    log_warn "Installation stopped before the runtime transaction; removing newly created bootstrap files."
+    remove_new_install_directory "$BASE_DIR" "$INSTALL_BASE_PREEXISTED" runtime || true
+    remove_new_install_directory "$CONFIG_DIR" "$INSTALL_CONFIG_PREEXISTED" configuration || true
+    remove_new_install_directory "$STATE_DIR" "$INSTALL_STATE_PREEXISTED" state || true
+}
+
+restore_install_state() {
+    local rollback_failed=0 service_state renew_state timer_state
+    log_warn "The installation failed; restoring the previous Apple Relay state."
+
+    if ! systemctl stop apple-relay-renew.timer apple-relay-renew.service apple-relay.service; then
+        log_warn "systemctl reported an error while stopping the failed runtime; verifying the final state."
+    fi
+    systemctl disable apple-relay-renew.timer apple-relay.service >/dev/null 2>&1 || true
+
+    service_state="$(systemd_effective_active_state apple-relay.service)" || return 1
+    renew_state="$(systemd_effective_active_state apple-relay-renew.service)" || return 1
+    timer_state="$(systemd_effective_active_state apple-relay-renew.timer)" || return 1
+    if [[ "$service_state" != "inactive" && "$service_state" != "failed" ]] \
+        || [[ "$renew_state" != "inactive" && "$renew_state" != "failed" ]] \
+        || [[ "$timer_state" != "inactive" && "$timer_state" != "failed" ]]; then
+        log_error "A new Apple Relay process is still active; rollback cannot safely replace its files."
+        log_error "Automatic rollback was not attempted. The rollback snapshot was preserved at ${INSTALL_BACKUP_DIR}."
+        return 1
+    fi
+
+    if [[ -e "$BASE_DIR" ]]; then
+        if is_managed_dir "$BASE_DIR"; then
+            if ! remove_managed_dir "$BASE_DIR"; then
+                rollback_failed=1
+                log_error "The current runtime directory could not be removed during rollback."
+            fi
+        else
+            rollback_failed=1
+            log_error "The current runtime directory is unowned; refusing to replace it during rollback."
+        fi
+    fi
+    if [[ ! -e "$BASE_DIR" && ! -L "$BASE_DIR" \
+        && (-e "${INSTALL_BACKUP_DIR}/base" || -L "${INSTALL_BACKUP_DIR}/base") ]]; then
+        cp -a -- "${INSTALL_BACKUP_DIR}/base" "$BASE_DIR" || rollback_failed=1
+    elif [[ -e "$BASE_DIR" || -L "$BASE_DIR" ]]; then
+        rollback_failed=1
+    fi
+    restore_install_file "${INSTALL_BACKUP_DIR}/relayctl-launcher" "$LAUNCHER_PATH" \
+        || rollback_failed=1
+
+    if [[ -e "$CONFIG_DIR" || -L "$CONFIG_DIR" ]]; then
+        if is_managed_dir "$CONFIG_DIR"; then
+            if ! remove_managed_dir "$CONFIG_DIR"; then
+                rollback_failed=1
+                log_error "The current configuration directory could not be removed during rollback."
+            fi
+        else
+            rollback_failed=1
+            log_error "The current configuration directory is unowned; refusing to replace it during rollback."
+        fi
+    fi
+    if [[ ! -e "$CONFIG_DIR" && ! -L "$CONFIG_DIR" \
+        && (-e "${INSTALL_BACKUP_DIR}/config" || -L "${INSTALL_BACKUP_DIR}/config") ]]; then
+        cp -a -- "${INSTALL_BACKUP_DIR}/config" "$CONFIG_DIR" || rollback_failed=1
+    elif [[ -e "$CONFIG_DIR" || -L "$CONFIG_DIR" ]]; then
+        rollback_failed=1
+    fi
+
+    if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+        if is_managed_dir "$STATE_DIR"; then
+            if ! remove_managed_dir "$STATE_DIR"; then
+                rollback_failed=1
+                log_error "The current state directory could not be removed during rollback."
+            fi
+        else
+            rollback_failed=1
+            log_error "The current state directory is unowned; refusing to replace it during rollback."
+        fi
+    fi
+    if (( INSTALL_SERVICE_USER_EXISTED == 0 )) && id -u "$SERVICE_USER" >/dev/null 2>&1; then
+        userdel "$SERVICE_USER" >/dev/null 2>&1 || rollback_failed=1
+    fi
+    if (( INSTALL_SERVICE_GROUP_EXISTED == 0 )) && getent group "$SERVICE_USER" >/dev/null 2>&1; then
+        groupdel "$SERVICE_USER" >/dev/null 2>&1 || rollback_failed=1
+    fi
+    if [[ ! -e "$STATE_DIR" && ! -L "$STATE_DIR" \
+        && (-e "${INSTALL_BACKUP_DIR}/state" || -L "${INSTALL_BACKUP_DIR}/state") ]]; then
+        cp -a -- "${INSTALL_BACKUP_DIR}/state" "$STATE_DIR" || rollback_failed=1
+    elif [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+        rollback_failed=1
+    fi
+
+    remove_new_install_directory "$BASE_DIR" "$INSTALL_BASE_PREEXISTED" runtime \
+        || rollback_failed=1
+    remove_new_install_directory "$CONFIG_DIR" "$INSTALL_CONFIG_PREEXISTED" configuration \
+        || rollback_failed=1
+    remove_new_install_directory "$STATE_DIR" "$INSTALL_STATE_PREEXISTED" state \
+        || rollback_failed=1
+
+    restore_install_file "${INSTALL_BACKUP_DIR}/apple-relay.service" "$SERVICE_UNIT" \
+        || rollback_failed=1
+    restore_install_file "${INSTALL_BACKUP_DIR}/apple-relay-renew.service" "$RENEW_SERVICE_UNIT" \
+        || rollback_failed=1
+    restore_install_file "${INSTALL_BACKUP_DIR}/apple-relay-renew.timer" "$RENEW_TIMER_UNIT" \
+        || rollback_failed=1
+    systemctl daemon-reload || rollback_failed=1
+
+    restore_unit_enable_state apple-relay.service "$INSTALL_SERVICE_ENABLE_STATE" \
+        || rollback_failed=1
+    restore_unit_enable_state apple-relay-renew.timer "$INSTALL_TIMER_ENABLE_STATE" \
+        || rollback_failed=1
+
+    if (( rollback_failed == 0 && INSTALL_SERVICE_WAS_ACTIVE == 1 )); then
+        if validate_saved_environment; then
+            if restart_relay_service; then
+                log_ok "The previous Apple Relay service was restored."
+            else
+                rollback_failed=1
+                log_error "The previous files were restored, but the Apple Relay service did not restart."
+            fi
+        else
+            log_warn "The restored relay.env is invalid (${ENVIRONMENT_ERROR}); checking the restored service through systemd only."
+            systemctl reset-failed apple-relay.service >/dev/null 2>&1 || true
+            if systemctl restart apple-relay.service \
+                && sleep 1 \
+                && systemctl is-active --quiet apple-relay.service; then
+                log_ok "The previous Apple Relay process was restored despite its invalid management configuration."
+            else
+                rollback_failed=1
+                log_error "The previous files were restored, but the Apple Relay service did not restart."
+                journalctl -u apple-relay.service -n 100 --no-pager >&2 || true
+            fi
+        fi
+    fi
+    if (( rollback_failed == 0 && INSTALL_RENEW_SERVICE_WAS_ACTIVE == 1 )); then
+        if ! systemctl start apple-relay-renew.service; then
+            rollback_failed=1
+            log_error "The previous certificate renewal job could not be restarted."
+        fi
+    fi
+    if (( rollback_failed == 0 && INSTALL_TIMER_WAS_ACTIVE == 1 )); then
+        if ! systemctl start apple-relay-renew.timer; then
+            rollback_failed=1
+            log_error "The previous certificate renewal timer could not be restarted."
+        fi
+    fi
+
+    if (( rollback_failed == 0 )); then
+        if ! cleanup_install_backup; then
+            rollback_failed=1
+            log_error "The previous state was restored, but the rollback snapshot could not be removed."
+        fi
+    else
+        log_error "Automatic rollback was incomplete. The rollback snapshot was preserved at ${INSTALL_BACKUP_DIR}."
+    fi
+    return "$rollback_failed"
+}
+
+process_identity() {
+    local process_id="$1"
+    local stat_line remainder
+    local fields=()
+    [[ -r "/proc/${process_id}/stat" ]] || return 1
+    stat_line="$(<"/proc/${process_id}/stat")"
+    remainder="${stat_line##*) }"
+    read -r -a fields <<<"$remainder"
+    [[ -n "${fields[1]:-}" && -n "${fields[19]:-}" ]] || return 1
+    printf '%s:%s\n' "${fields[1]}" "${fields[19]}"
+}
+
+collect_install_process_tree() {
+    local process_id="$1"
+    local expected_parent="${2:-}"
+    local child_id children_file children="" identity_before identity_after seen=" "
+    identity_before="$(process_identity "$process_id")" || return 0
+    if [[ -n "$expected_parent" \
+        && "${identity_before%%:*}" != "$expected_parent" ]]; then
+        return 0
+    fi
+    kill -STOP "$process_id" 2>/dev/null || return 0
+    identity_after="$(process_identity "$process_id")" || {
+        kill -CONT "$process_id" 2>/dev/null || true
+        return 0
+    }
+    if [[ "$identity_before" != "$identity_after" ]]; then
+        kill -CONT "$process_id" 2>/dev/null || true
+        return 0
+    fi
+    INSTALL_PROCESS_TREE_PIDS+=("$process_id")
+    INSTALL_PROCESS_TREE_IDENTITIES+=("${identity_after#*:}")
+    for children_file in "/proc/${process_id}"/task/*/children; do
+        [[ -r "$children_file" ]] || continue
+        children=""
+        read -r children <"$children_file" || true
+        for child_id in $children; do
+            if [[ "$seen" != *" ${child_id} "* ]]; then
+                seen+="${child_id} "
+                collect_install_process_tree "$child_id" "$process_id"
+            fi
+        done
+    done
+}
+
+install_process_identity_matches() {
+    local index="$1"
+    local current_identity
+    current_identity="$(process_identity "${INSTALL_PROCESS_TREE_PIDS[$index]}")" || return 1
+    [[ "${current_identity#*:}" == "${INSTALL_PROCESS_TREE_IDENTITIES[$index]}" ]]
+}
+
+terminate_install_process_tree() {
+    local index process_id
+    INSTALL_PROCESS_TREE_PIDS=()
+    INSTALL_PROCESS_TREE_IDENTITIES=()
+    collect_install_process_tree "$1"
+    for ((index = ${#INSTALL_PROCESS_TREE_PIDS[@]} - 1; index >= 0; index--)); do
+        install_process_identity_matches "$index" || continue
+        process_id="${INSTALL_PROCESS_TREE_PIDS[$index]}"
+        kill -TERM "$process_id" 2>/dev/null || true
+        kill -CONT "$process_id" 2>/dev/null || true
+    done
+    sleep 1
+    for index in "${!INSTALL_PROCESS_TREE_PIDS[@]}"; do
+        install_process_identity_matches "$index" || continue
+        process_id="${INSTALL_PROCESS_TREE_PIDS[$index]}"
+        kill -KILL "$process_id" 2>/dev/null || true
+    done
+}
+
+interrupt_install_transaction() {
+    local signal_name="$1"
+    INSTALL_INTERRUPTED_SIGNAL="$signal_name"
+    if [[ "$INSTALL_APPLY_PID" =~ ^[0-9]+$ ]]; then
+        terminate_install_process_tree "$INSTALL_APPLY_PID"
+    fi
+}
+
+apply_install_configuration() {
+    prepare_runtime_installation
+    if (( REUSE_EXISTING_CONFIG == 0 )); then
+        save_environment
+    fi
+    if [[ ! -s "$TOKEN_FILE" ]]; then
+        random_token | write_atomic "$TOKEN_FILE" 600
+    fi
+    ensure_letsencrypt_certificate
+    if (( REUSE_EXISTING_CONFIG == 0 || REBUILD_EXISTING_ENVOY_CONFIG == 1 )); then
+        render_envoy_config
+    fi
+    secure_runtime_files
+    if ! validate_envoy_config; then
+        if (( REUSE_EXISTING_CONFIG == 1 && REBUILD_EXISTING_ENVOY_CONFIG == 0 )); then
+            log_warn "The preserved Envoy configuration is incompatible with the new runtime and will be rebuilt."
+            render_envoy_config
+            secure_runtime_files
+            validate_envoy_config
+        else
+            return 1
+        fi
+    fi
+    install_systemd_units
+    restart_relay_service \
+        || { log_error "Apple Relay failed to start."; return 1; }
+    if ! systemctl enable --now apple-relay-renew.timer >/dev/null; then
+        log_error "Apple Relay started, but the certificate renewal timer could not be enabled."
+        return 1
+    fi
 }
 
 collect_install_configuration() {
@@ -921,37 +2200,129 @@ collect_install_configuration() {
 
 install_relay() {
     require_root
-    claim_project_dirs
     attach_tty
     require_tty
     install_base_dependencies
-    install_gum
-    publish_manager
-    install_envoy
+
+    PREVIOUS_INSTALLATION_DETECTED=0
+    EXISTING_CONFIG_INVALID=0
+    EXISTING_CONFIG_ERROR=""
+    EXISTING_TOKEN_INVALID=0
+    EXISTING_TOKEN_ERROR=""
+    REUSE_EXISTING_CONFIG=0
+    REBUILD_EXISTING_ENVOY_CONFIG=0
+    INSTALL_BASE_PREEXISTED=0
+    INSTALL_CONFIG_PREEXISTED=0
+    INSTALL_STATE_PREEXISTED=0
+    [[ -e "$BASE_DIR" || -L "$BASE_DIR" ]] && INSTALL_BASE_PREEXISTED=1
+    [[ -e "$CONFIG_DIR" || -L "$CONFIG_DIR" ]] && INSTALL_CONFIG_PREEXISTED=1
+    [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]] && INSTALL_STATE_PREEXISTED=1
+    INSTALL_BOOTSTRAP_CLEANUP_ACTIVE=1
+    trap cleanup_install_bootstrap_on_exit EXIT
+    detect_previous_installation
+    if [[ -e "$CONFIG_DIR" || -L "$CONFIG_DIR" ]]; then
+        is_managed_dir "$CONFIG_DIR" \
+            || die "Refusing to inspect or replace an unowned configuration directory: ${CONFIG_DIR}"
+        assert_existing_tls_layout_safe
+    fi
 
     local previous_listen_port=""
     local previous_admin_port=""
     if [[ -f "$ENV_FILE" ]]; then
-        load_environment
-        previous_listen_port="$LISTEN_PORT"
-        previous_admin_port="$ADMIN_PORT"
+        if assess_existing_configuration; then
+            previous_listen_port="$LISTEN_PORT"
+            previous_admin_port="$ADMIN_PORT"
+        else
+            log_warn "Existing configuration validation failed: ${EXISTING_CONFIG_ERROR}"
+        fi
+    elif [[ -d "$CONFIG_DIR" ]] \
+        && find "$CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name "$OWNERSHIP_MARKER" -print -quit \
+            | grep -q .; then
+        validate_existing_project_configuration || true
+        EXISTING_CONFIG_INVALID=1
+        EXISTING_CONFIG_ERROR="The configuration directory exists, but relay.env is missing."
+        log_warn "Existing configuration validation failed: ${EXISTING_CONFIG_ERROR}"
+        if (( EXISTING_TOKEN_INVALID == 1 )); then
+            log_warn "${EXISTING_TOKEN_ERROR} A new token will be generated."
+        fi
     fi
-    collect_install_configuration
-    wait_for_dns
-    preflight_ports "$previous_listen_port" "$previous_admin_port"
-    save_environment
 
-    if [[ ! -s "$TOKEN_FILE" ]]; then
-        random_token | write_atomic "$TOKEN_FILE" 600
+    claim_project_dirs
+    install_gum
+    if (( PREVIOUS_INSTALLATION_DETECTED == 1 )); then
+        log_info "A previous managed Apple Relay runtime was detected and will be replaced after validation."
     fi
-    ensure_letsencrypt_certificate
-    render_envoy_config
-    secure_runtime_files
-    validate_envoy_config
-    install_systemd_units
-    systemctl restart apple-relay.service
-    wait_for_relay_ready \
-        || { journalctl -u apple-relay.service -n 60 --no-pager >&2; die "Apple Relay failed to start."; }
+    if (( REUSE_EXISTING_CONFIG == 1 )); then
+        log_info "Validated existing configuration for ${DOMAIN}; it will be preserved during the runtime upgrade."
+    else
+        DOMAIN=""
+        LISTEN_ADDRESS="0.0.0.0"
+        LISTEN_PORT="443"
+        ADMIN_PORT="9901"
+        PUBLIC_IPV4=""
+        CERT_EMAIL=""
+        collect_install_configuration
+    fi
+    wait_for_dns
+    if (( PREVIOUS_INSTALLATION_DETECTED == 0 )); then
+        preflight_ports "$previous_listen_port" "$previous_admin_port"
+    fi
+
+    local install_status=0
+    INSTALL_INTERRUPTED_SIGNAL=""
+    INSTALL_APPLY_PID=""
+    trap 'interrupt_install_transaction INT' INT
+    trap 'interrupt_install_transaction TERM' TERM
+    trap 'interrupt_install_transaction HUP' HUP
+    if ! snapshot_install_state; then
+        trap - INT TERM HUP
+        die "Could not create a rollback snapshot; no existing runtime was removed."
+    fi
+    if [[ -n "$INSTALL_INTERRUPTED_SIGNAL" ]]; then
+        resume_preinstall_renewal_state || true
+        cleanup_install_backup || true
+        trap - INT TERM HUP
+        die "Installation was interrupted by ${INSTALL_INTERRUPTED_SIGNAL} before the previous runtime was removed."
+    fi
+    INSTALL_BOOTSTRAP_CLEANUP_ACTIVE=0
+    trap - EXIT
+    if [[ -z "$INSTALL_INTERRUPTED_SIGNAL" ]]; then
+        set +e
+        (
+            set -Eeuo pipefail
+            apply_install_configuration
+        ) &
+        INSTALL_APPLY_PID=$!
+        if [[ -n "$INSTALL_INTERRUPTED_SIGNAL" ]]; then
+            terminate_install_process_tree "$INSTALL_APPLY_PID"
+        fi
+        while true; do
+            wait "$INSTALL_APPLY_PID"
+            install_status=$?
+            if ! kill -0 "$INSTALL_APPLY_PID" 2>/dev/null; then
+                break
+            fi
+        done
+        set -e
+    else
+        install_status=130
+    fi
+    INSTALL_APPLY_PID=""
+    if [[ -n "$INSTALL_INTERRUPTED_SIGNAL" ]]; then
+        log_warn "Installation was interrupted by ${INSTALL_INTERRUPTED_SIGNAL}; rolling back."
+        install_status=130
+    fi
+    if (( install_status != 0 )); then
+        if restore_install_state; then
+            trap - INT TERM HUP
+            die "Installation failed, and the previous Apple Relay state was restored. Review the error shown above."
+        fi
+        trap - INT TERM HUP
+        die "Installation failed, and automatic rollback was incomplete. Review the errors above; the rollback snapshot is at ${INSTALL_BACKUP_DIR}."
+    fi
+    cleanup_install_backup \
+        || log_warn "The installation succeeded, but its temporary rollback snapshot could not be removed."
+    trap - INT TERM HUP
 
     local token
     token="$(cat "$TOKEN_FILE")"
@@ -988,8 +2359,8 @@ restart_relay() {
     require_root
     load_environment || die "Apple Relay is not configured."
     validate_envoy_config
-    systemctl restart apple-relay.service
-    wait_for_relay_ready || die "Apple Relay failed to restart."
+    restart_relay_service \
+        || die "Apple Relay failed to restart. The service logs for this attempt are shown above."
     log_ok "Apple Relay restarted."
 }
 
@@ -1010,11 +2381,11 @@ rotate_token() {
         render_envoy_config
         die "Token rotation failed validation; the old token was restored."
     fi
-    if ! systemctl restart apple-relay.service || ! wait_for_relay_ready; then
+    if ! restart_relay_service; then
         printf '%s\n' "$old_token" | write_atomic "$TOKEN_FILE" 600
-        render_envoy_config
-        systemctl restart apple-relay.service || true
-        wait_for_relay_ready || true
+        if ! render_envoy_config || ! validate_envoy_config || ! restart_relay_service; then
+            die "Token rotation failed. The old token was restored, but Apple Relay could not be returned to a running state; review the errors above."
+        fi
         die "Token rotation failed; the old token was restored."
     fi
 
@@ -1030,8 +2401,7 @@ renew_certificate() {
     local quiet=0
     [[ "${1:-}" == "--quiet" ]] && quiet=1
     load_environment || die "Apple Relay is not configured."
-    dns_points_to_relay \
-        || die "1.1.1.1 no longer returns only A=${PUBLIC_IPV4} for ${DOMAIN}; certificate renewal was not attempted."
+    require_dns_points_to_relay "Certificate renewal"
     install_certbot
     local old_hash new_hash
     old_hash="$(sha256_file "${TLS_DIR}/fullchain.pem")"
@@ -1040,8 +2410,8 @@ renew_certificate() {
     new_hash="$(sha256_file "${TLS_DIR}/fullchain.pem")"
     if [[ "$old_hash" != "$new_hash" ]]; then
         validate_envoy_config
-        systemctl restart apple-relay.service
-        wait_for_relay_ready || die "The certificate was renewed, but Apple Relay failed to become ready."
+        restart_relay_service \
+            || die "The certificate was renewed, but Apple Relay failed to restart; the service logs are shown above."
         (( quiet == 1 )) || log_ok "The certificate was renewed and Apple Relay was restarted."
     else
         (( quiet == 1 )) || log_info "The certificate is not due for renewal."
@@ -1055,12 +2425,11 @@ reissue_certificate() {
     install_gum
     load_environment || die "Apple Relay is not configured."
     confirm "Force a new Let's Encrypt certificate through HTTP-01?" || return 0
-    dns_points_to_relay \
-        || die "1.1.1.1 must return only A=${PUBLIC_IPV4} for ${DOMAIN} before certificate reissuance."
+    require_dns_points_to_relay "Certificate reissuance"
     issue_letsencrypt_certificate 1
     validate_envoy_config
-    systemctl restart apple-relay.service
-    wait_for_relay_ready || die "The new certificate was issued, but Apple Relay failed to become ready."
+    restart_relay_service \
+        || die "The new certificate was issued, but Apple Relay failed to restart; the service logs are shown above."
     log_ok "A new certificate was issued and Apple Relay was restarted."
 }
 

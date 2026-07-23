@@ -33,11 +33,13 @@ After installation, open the management interface with:
 sudo relayctl
 ```
 
+When a previous managed installation is detected, the installer validates its ownership and configuration, snapshots it, removes only the known runtime files and systemd units, and then installs the new runtime. Valid configuration, tokens, and TLS files are preserved. Invalid derived files are rebuilt, while unsafe or unrecognized paths stop the installation. If the new runtime fails, the previous files and service state are restored automatically.
+
 ## Certificates
 
-The manager deliberately supports one certificate path: **Let's Encrypt HTTP-01**. During installation, it shows the exact `A` record to create and polls Cloudflare's `1.1.1.1` resolver until the public answer matches the selected server IPv4 address. Installation stops if the answer differs or an `AAAA` record is present. The public Internet must also be able to reach TCP port `80`. The relay itself always listens on `0.0.0.0:443`.
+The manager deliberately supports one certificate path: **Let's Encrypt HTTP-01**. During installation, it shows the exact `A` record to create and polls Cloudflare's `1.1.1.1` resolver until the public answer matches the selected server IPv4 address. The propagation check has a five-minute wall-clock deadline, reports DNS-over-HTTPS transport, HTTP, parsing, and resolver errors, and stops early after repeated query failures. Installation stops if the answer differs or an `AAAA` record is present. The public Internet must also be able to reach TCP port `80`. The relay itself always listens on `0.0.0.0:443`.
 
-On installation and reconfiguration, the manager first validates the certificate's activation and expiration times, hostname, and private key. It reuses a valid deployed certificate or Certbot lineage and requests a certificate only when neither is valid. The manager also installs a daily systemd renewal timer; the renewal job restarts Envoy only when the deployed certificate changes. A forced reissue is available from the Gum interface and restarts Envoy after issuance succeeds.
+On installation and reconfiguration, the manager validates the certificate's activation and expiration times, hostname, private key, and renewable Certbot lineage. It reuses a valid lineage and repairs deployments that have a certificate but no renewable lineage. The manager also installs a daily systemd renewal timer; the renewal job restarts Envoy only when the deployed certificate changes. A forced reissue is available from the Gum interface and restarts Envoy after issuance succeeds.
 
 ## Client values
 

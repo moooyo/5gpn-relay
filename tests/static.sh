@@ -12,6 +12,11 @@ grep -q 'rotate-token' <<<"$help_output"
 grep -q 'decommission' <<<"$help_output"
 grep -q 'reissue-cert' <<<"$help_output"
 grep -q 'https://1.1.1.1/dns-query' "$INSTALLER"
+grep -q -- '--disable-hot-restart' "$INSTALLER"
+grep -q 'spin --show-error' "$INSTALLER"
+grep -q '^detect_previous_installation()' "$INSTALLER"
+grep -q '^remove_previous_runtime_installation()' "$INSTALLER"
+grep -q 'DropInPaths' "$INSTALLER"
 grep -q 'ENVOY_SHA256_X86_64=' "$INSTALLER"
 grep -q 'prompt_input "Relay domain:"' "$INSTALLER"
 # shellcheck disable=SC2016
@@ -33,8 +38,10 @@ grep -q '"Install"|"Reconfigure / reinstall") install_relay; return 0 ;;' "$INST
 grep -q "printf 'Relay domain: %s" "$INSTALLER"
 
 install_body="$(sed -n '/^install_relay() {$/,/^}$/p' "$INSTALLER")"
-grep -q 'ensure_letsencrypt_certificate' <<<"$install_body"
-if grep -qE '^[[:space:]]+issue_letsencrypt_certificate([[:space:]]|$)' <<<"$install_body"; then
+apply_body="$(sed -n '/^apply_install_configuration() {$/,/^}$/p' "$INSTALLER")"
+grep -q 'apply_install_configuration' <<<"$install_body"
+grep -q 'ensure_letsencrypt_certificate' <<<"$apply_body"
+if grep -qE '^[[:space:]]+issue_letsencrypt_certificate([[:space:]]|$)' <<<"${install_body}${apply_body}"; then
     echo "Installation must validate and reuse a current certificate before requesting one." >&2
     exit 1
 fi
@@ -49,6 +56,11 @@ grep -q 'Apple Relay manager' <<<"$stdin_help_output"
 
 if grep -nE 'dns-cloudflare|self-signed|HTTP3RelayURL|relay_http3' "$INSTALLER"; then
     echo "Only HTTP-01 certificates and the HTTP/2 relay are supported." >&2
+    exit 1
+fi
+
+if grep -nE '/dev/shm/envoy_shared_memory|[[:space:]]pkill[[:space:]].*envoy' "$INSTALLER"; then
+    echo "The installer must not delete global Envoy IPC or kill unrelated Envoy processes." >&2
     exit 1
 fi
 
