@@ -958,7 +958,8 @@ certificate_is_current_for_domain() {
     current_time="${verification_time:-$(date -u +%s)}"
     (( current_time >= not_before_epoch && current_time <= not_after_epoch )) \
         || return 1
-    openssl x509 -in "$certificate" -noout -checkhost "$DOMAIN" >/dev/null 2>&1
+    openssl verify -CAfile "$certificate" -verify_hostname "$DOMAIN" \
+        "$certificate" >/dev/null 2>&1
 }
 
 validate_certificate_pair() {

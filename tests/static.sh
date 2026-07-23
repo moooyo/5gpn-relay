@@ -17,6 +17,11 @@ grep -q 'spin --show-error' "$INSTALLER"
 grep -q '^detect_previous_installation()' "$INSTALLER"
 grep -q '^remove_previous_runtime_installation()' "$INSTALLER"
 grep -q 'DropInPaths' "$INSTALLER"
+grep -q -- '-verify_hostname' "$INSTALLER"
+if grep -q -- '-checkhost' "$INSTALLER"; then
+    echo "Certificate hostname checks must not depend on openssl x509 -checkhost exit codes." >&2
+    exit 1
+fi
 grep -q 'ENVOY_SHA256_X86_64=' "$INSTALLER"
 grep -q 'prompt_input "Relay domain:"' "$INSTALLER"
 # shellcheck disable=SC2016
