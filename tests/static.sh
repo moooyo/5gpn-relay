@@ -24,6 +24,13 @@ if grep -q -- '-checkhost' "$INSTALLER"; then
 fi
 grep -q 'ENVOY_SHA256_X86_64=' "$INSTALLER"
 grep -q 'prompt_input "Relay domain:"' "$INSTALLER"
+grep -q 'choose --header .* </dev/tty' "$INSTALLER"
+grep -q 'input --prompt .* </dev/tty' "$INSTALLER"
+grep -q 'confirm .* </dev/tty' "$INSTALLER"
+if grep -q 'exec </dev/tty' "$INSTALLER"; then
+    echo "The installer must not replace stdin while Bash is reading a piped script." >&2
+    exit 1
+fi
 # shellcheck disable=SC2016
 grep -Fq 'prompt_input "Public IPv4 for the DNS A record:" "${PUBLIC_IPV4:-$detected_public_ipv4}"' "$INSTALLER"
 

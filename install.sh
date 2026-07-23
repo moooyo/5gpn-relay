@@ -132,13 +132,11 @@ require_root() {
 }
 
 require_tty() {
-    [[ -t 0 && -t 1 ]] || die "This command requires an interactive terminal."
+    [[ -t 1 && -r /dev/tty ]] || die "This command requires an interactive terminal."
 }
 
 attach_tty() {
-    if [[ ! -t 0 && -r /dev/tty ]]; then
-        exec </dev/tty
-    fi
+    [[ -r /dev/tty ]] || die "An interactive terminal is required."
 }
 
 command_exists() {
@@ -396,17 +394,17 @@ validate_existing_project_configuration() {
 choose() {
     local header="$1"
     shift
-    printf '%s\n' "$@" | "$GUM_BIN" choose --header "$header"
+    "$GUM_BIN" choose --header "$header" "$@" </dev/tty
 }
 
 prompt_input() {
     local prompt="$1"
     local value="${2:-}"
-    "$GUM_BIN" input --prompt "$prompt " --value "$value"
+    "$GUM_BIN" input --prompt "$prompt " --value "$value" </dev/tty
 }
 
 confirm() {
-    "$GUM_BIN" confirm "$1"
+    "$GUM_BIN" confirm "$1" </dev/tty
 }
 
 spin() {
