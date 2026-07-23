@@ -124,10 +124,7 @@ die() {
 }
 
 have_gum() {
-    is_managed_dir "$BASE_DIR" \
-        && safe_root_owned_directory "${BASE_DIR}/bin" \
-        && [[ -x "$GUM_BIN" ]] \
-        && safe_root_owned_file "$GUM_BIN"
+    [[ -x "$GUM_BIN" ]]
 }
 
 require_root() {
@@ -448,15 +445,8 @@ install_gum() {
         return 0
     fi
     if [[ -e "$GUM_BIN" || -L "$GUM_BIN" ]]; then
-        die "Refusing to execute or replace an unsafe Gum binary: ${GUM_BIN}"
-    fi
-    if command_exists gum; then
-        local system_gum
-        system_gum="$(readlink -f "$(command -v gum)")"
-        safe_root_owned_file "$system_gum" \
-            || die "Refusing to copy an unsafe system Gum binary: ${system_gum}"
-        install -m 0755 "$system_gum" "$GUM_BIN"
-        return 0
+        rm -f -- "$GUM_BIN" \
+            || die "Could not replace the existing project Gum binary: ${GUM_BIN}"
     fi
 
     local machine archive_arch archive_name base_url temporary expected actual extracted

@@ -39,8 +39,13 @@ grep -q "printf 'Relay domain: %s" "$INSTALLER"
 
 install_body="$(sed -n '/^install_relay() {$/,/^}$/p' "$INSTALLER")"
 apply_body="$(sed -n '/^apply_install_configuration() {$/,/^}$/p' "$INSTALLER")"
+gum_body="$(sed -n '/^install_gum() {$/,/^}$/p' "$INSTALLER")"
 grep -q 'apply_install_configuration' <<<"$install_body"
 grep -q 'ensure_letsencrypt_certificate' <<<"$apply_body"
+if grep -q 'command_exists gum' <<<"$gum_body"; then
+    echo "Installation must use the pinned Gum download instead of a system Gum binary." >&2
+    exit 1
+fi
 if grep -qE '^[[:space:]]+issue_letsencrypt_certificate([[:space:]]|$)' <<<"${install_body}${apply_body}"; then
     echo "Installation must validate and reuse a current certificate before requesting one." >&2
     exit 1
